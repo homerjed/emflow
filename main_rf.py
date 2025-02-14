@@ -1,4 +1,5 @@
 import time
+import os
 from functools import partial
 from typing import Callable, Literal, Optional, Union
 
@@ -637,6 +638,14 @@ def get_E_x_x_t(x_t: XArray, cov_t: Covariance, score: XArray) -> XArray:
 
 
 @typecheck
+def get_cov_t(flow: RectifiedFlow, t: Scalar) -> Covariance:
+    (dim,) = flow.x_shape # Requires 1-dimensional data
+    sigma_t = flow.mu_sigma_t(t)[1]
+    cov_t = jnp.eye(dim) * jnp.square(sigma_t)
+    return cov_t
+
+
+@typecheck
 def get_score_y_x(
     y_: XArray, 
     x: XArray, # x_t
@@ -647,13 +656,16 @@ def get_score_y_x(
 ) -> XArray | tuple[XArray, XArray]:
     # Score of Gaussian linear data-likelihood G[y|x, cov_y] 
 
-    cov_t = jnp.eye(x.size) * jnp.square(flow.mu_sigma_t(t)[1])
+    cov_t = get_cov_t(flow, t)
 
     score_x = velocity_to_score(flow, t, x)
 
     E_x_x_t, dE_x_x_t = value_and_jacfwd(get_E_x_x_t, x, cov=cov_t, score=score_x)
 
-    score_y_x = dE_x_x_t @ jnp.linalg.inv(cov_y + cov_t @ dE_x_x_t) @ (y_ - E_x_x_t) # Eq 20, 22
+    V_x_x_t = cov_t @ dE_x_x_t
+
+    score_y_x = dE_x_x_t @ jnp.linalg.inv(cov_y + V_x_x_t) @ (y_ - E_x_x_t) # Eq 20, 22
+
     if return_score_x:
         return score_y_x, score_x
     else:
@@ -661,8 +673,94 @@ def get_score_y_x(
 
 
 @typecheck
+def get_score_gaussian_x_y(
+    y_: XArray, 
+    x: XArray, # x_t
+    cov_t: Covariance,
+    cov_inv_x: XArray,
+    cov_y: Covariance
+) -> XArray:
+    # Score of Gaussian kernel centred on data NOTE: mode="Gaussian" for init
+
+    score_x = x + cov_t @ cov_inv_x @ (x - mu_x) # Tweedie with score of analytic G[x|mu_x, cov_x]
+
+    E_x_x_t, dE_x_x_t = value_and_jacfwd(get_E_x_x_t, x, cov_t, score_x) # Tweedie; mean and jacobian
+    V_x_x_t = cov_t @ dE_x_x_t # Or heuristics; cov_t, inv(cov_t)...
+    
+    score_y_x = dE_x_x_t @ jnp.linalg.inv(cov_y + V_x_x_t) @ (y_ - E_x_x_t) # Eq 20
+
+    score_x_y = score_y_x + score_x
+
+    return score_x_y
+
+
+@typecheck
 @eqx.filter_jit
-def single_x_y_sample_fn(
+def single_x_y_ddim_sample_fn(
+    flow: RectifiedFlow,
+    cov_x: Covariance, 
+    cov_y: Covariance, 
+    key: PRNGKeyArray, 
+    y_: XArray,
+    *,
+    q_0_sampling: bool = False, # Sampling initially or not
+    n_steps: int = 1000,
+    mode: Literal["full", "cg"] = "full"
+) -> XArray:
+    # DDIM sampler including data-likelihood score
+
+    key_z, key_sample = jr.split(key)
+
+    cov_inv_x = jnp.linalg.inv(cov_x)
+
+    # Reversed times
+    times = jnp.linspace(
+        flow.soln_kwargs["t1"], 
+        flow.soln_kwargs["t0"], 
+        n_steps + 1 
+    )
+
+    flow = eqx.nn.inference_mode(flow)
+
+    def sample_step(i: Scalar, x_t: XArray) -> tuple[XArray, PRNGKeyArray]:
+        s, t = times[i], times[i + 1]
+
+        sigma_s, sigma_t = flow.mu_sigma_t(s)[1], flow.mu_sigma_t(t)[1]
+        cov_t = jnp.eye(y_.size) * jnp.square(sigma_t)
+
+        if q_0_sampling:
+            # Implement CG method for this
+            score_y_x, score_x = get_score_gaussian_x_y(
+                y_, x, cov_t, cov_inv_x, cov_y
+            )
+        else:
+            if mode == "full":
+                score_y_x, score_x = get_score_y_x(
+                    y_, x_t, t, flow, cov_y, return_score_x=True # x is x_t
+                ) 
+            if mode == "cg":
+                score_y_x, score_x = get_score_y_x_cg(
+                    y_, x_t, t, flow, cov_x, cov_y, return_score_x=True
+                ) 
+        score_x_y = score_y_x + score_x
+        x_s = x_t - (1. - sigma_s / sigma_t) * (x_t - score_x_y)
+        return x_s, key
+
+    z = jr.normal(key_z, flow.x_shape)
+
+    x, *_ = jax.lax.fori_loop(
+        lower=0, 
+        upper=n_steps, 
+        body_fun=sample_step, 
+        init_val=(z, key_sample)
+    )
+
+    return x
+
+
+@typecheck
+@eqx.filter_jit
+def single_x_y_sample_fn_ode(
     flow: RectifiedFlow,
     cov_x: Covariance, 
     cov_y: Covariance, 
@@ -673,16 +771,22 @@ def single_x_y_sample_fn(
 ) -> XArray:
     # Latent posterior sampling function
 
-    def reverse_ode(t, y, args):
+    def reverse_ode(t, x, args):
         # Sampling along conditional score p(x|y)
         t = jnp.asarray(t)
-        # score_x = velocity_to_score(flow, t, y)
+
         if mode == "full":
-            score_y_x, score_x = get_score_y_x(y_, y, t, flow, cov_y, return_score_x=True) # This y is x_t
+            score_y_x, score_x = get_score_y_x(
+                y_, x, t, flow, cov_y, return_score_x=True # x is x_t
+            ) 
         if mode == "cg":
-            score_y_x = get_score_y_x_cg(y_, y, t, flow, cov_x, cov_y) 
+            score_y_x, score_x = get_score_y_x_cg(
+                y_, x, t, flow, cov_x, cov_y, return_score_x=True
+            ) 
+
         score_x_y = score_x + score_y_x
-        return flow.reverse_ode(y, t, score=score_x_y) # NOTE: reverse ode of flow sde, try stochastic also
+
+        return flow.reverse_ode(x, t, score=score_x_y) # NOTE: reverse ode of flow sde, try stochastic also
 
     sol = dfx.diffeqsolve(
         dfx.ODETerm(reverse_ode), 
@@ -694,7 +798,7 @@ def single_x_y_sample_fn(
 
 @typecheck
 @eqx.filter_jit
-def sample_initial_score(
+def sample_initial_score_ode(
     mu_x: XArray, 
     cov_x: Covariance, 
     flow: RectifiedFlow, 
@@ -708,27 +812,28 @@ def sample_initial_score(
     @typecheck
     def get_score_gaussian_y_x(
         y_: XArray, 
-        y: XArray, # x_t
+        x: XArray, # x_t
         cov_t: Covariance,
         score: XArray, 
         cov_y: Covariance
     ) -> XArray:
         # Score of Gaussian kernel centred on data NOTE: mode="Gaussian" for init
-        E_x_x_t, dE_x_x_t = value_and_jacfwd(get_E_x_x_t, y, cov_t, score) # Tweedie; mean and jacobian
+        E_x_x_t, dE_x_x_t = value_and_jacfwd(get_E_x_x_t, x, cov_t, score) # Tweedie; mean and jacobian
         V_x_x_t = cov_t @ dE_x_x_t # Or heuristics; cov_t, inv(cov_t)...
         return dE_x_x_t @ jnp.linalg.inv(cov_y + V_x_x_t) @ (y_ - E_x_x_t) # Eq 20
 
-    def reverse_ode(t, y, args):
+    def reverse_ode(t, x, args):
         # Sampling along conditional score p(x|y)
         t = jnp.asarray(t)
 
-        cov_t = jnp.eye(y.size) * jnp.square(flow.mu_sigma_t(t)[1])
+        cov_t = get_cov_t(flow, t)
 
-        score_x = y + cov_t @ cov_inv_x @ (y - mu_x) # Tweedie with score of analytic G[x|mu_x, cov_x]
-        score_y_x = get_score_gaussian_y_x(y_, y, cov_t, score_x, cov_y) # This y is x_t?
+        score_x = x + cov_t @ cov_inv_x @ (x - mu_x) # Tweedie with score of analytic G[x|mu_x, cov_x]
+        score_y_x = get_score_gaussian_y_x(y_, x, cov_t, score_x, cov_y) # This y is x_t?
 
         score_x_y = score_x + score_y_x
-        return flow.reverse_ode(y, t, score=score_x_y) 
+
+        return flow.reverse_ode(x, t, score=score_x_y) 
 
     sol = dfx.diffeqsolve(
         dfx.ODETerm(reverse_ode), 
@@ -743,14 +848,16 @@ def sample_initial_score(
 """
 
 
-def plot_losses(losses_k):
+def plot_losses(losses_k, save_dir="imgs/"):
+    losses_k = jnp.asarray(losses_k)
+    losses_k = losses_k[jnp.abs(losses_k - jnp.mean(losses_k)) < 2. * jnp.std(losses_k)]
     plt.figure()
     plt.loglog(losses_k)
-    plt.savefig("imgs/L.png")
+    plt.savefig(os.path.join(save_dir, "L.png"))
     plt.close()
 
 
-def plot_samples(X, X_Y, Y, X_, n_plot=8000, iteration=0):
+def plot_samples(X, X_Y, Y, X_, n_plot=8000, iteration=0, save_dir="imgs/"):
     fig, axs = plt.subplots(2, 1, figsize=(4., 9.), dpi=200)
     ax = axs[0]
     ax.scatter(*X[:n_plot].T, s=0.05, marker=".", color="k", label=r"$x\sim p(x)$")
@@ -761,31 +868,57 @@ def plot_samples(X, X_Y, Y, X_, n_plot=8000, iteration=0):
     ax.scatter(*X[:n_plot].T, s=0.05, marker=".", color="k", label=r"$x\sim p(x)$")
     ax.scatter(*X_[:n_plot].T, s=0.05, marker=".", color="g", label=r"$x\sim p_{\theta}(x)$")
     ax.legend(frameon=False)
-    plt.savefig("imgs/samples_{:04d}.png".format(iteration))
+    plt.savefig(os.path.join(save_dir, "samples_{:04d}.png".format(iteration)))
     plt.close()
 
 
 @typecheck
-def get_x_y_sampler(
+def get_initial_x_y_sampler_ode(
     flow: RectifiedFlow, 
-    cov_x: Covariance, 
-    cov_y: Covariance, 
-    mode: Literal["full", "cg"] = "full"
+    mu_x: XArray, 
+    cov_x: Covariance
 ) -> Callable[[PRNGKeyArray, XArray], XArray]:
-    fn = lambda key, y_: single_x_y_sample_fn(
-        flow, cov_x, cov_y, key, y_, mode=mode # NOTE: Why does this need cov_x?
+    fn = lambda key, y_: sample_initial_score_ode(
+        mu_x, cov_x, flow, key, y_
     )
     return fn
 
 
 @typecheck
-def get_initial_x_y_sampler(
+def get_x_y_sampler_ode(
+    flow: RectifiedFlow, 
+    cov_x: Covariance, 
+    cov_y: Covariance, 
+    mode: Literal["full", "cg"] = "full"
+) -> Callable[[PRNGKeyArray, XArray], XArray]:
+    fn = lambda key, y_: single_x_y_sample_fn_ode(
+        flow, cov_x, cov_y, key, y_, mode=mode # NOTE: Why does this need cov_x? Does cov_x need iterating?
+    )
+    return fn
+
+
+@typecheck
+def get_initial_x_y_sampler_ddim(
     flow: RectifiedFlow, 
     mu_x: XArray, 
-    cov_x: Covariance
+    cov_x: Covariance,
+    mode: Literal["full", "cg"] = "full"
 ) -> Callable[[PRNGKeyArray, XArray], XArray]:
-    fn = lambda key, y_: sample_initial_score(
-        mu_x, cov_x, flow, key, y_
+    fn = lambda key, y_: single_x_y_ddim_sample_fn(
+        mu_x, cov_x, flow, key, y_, q_0_sampling=True, mode=mode
+    )
+    return fn
+
+
+@typecheck
+def get_x_y_sampler_ddim(
+    flow: RectifiedFlow, 
+    cov_x: Covariance, 
+    cov_y: Covariance, 
+    mode: Literal["full", "cg"] = "full"
+) -> Callable[[PRNGKeyArray, XArray], XArray]:
+    fn = lambda key, y_: single_x_y_ddim_sample_fn(
+        flow, cov_x, cov_y, key, y_, q_0_sampling=False, mode=mode # NOTE: Why does this need cov_x? Does cov_x need iterating?
     )
     return fn
 
@@ -808,14 +941,16 @@ def get_opt_and_state(
     optimiser: Union[
         optax.GradientTransformation, 
         optax.GradientTransformationExtraArgs
-    ] = optax.adam, 
+    ] = optax.adamw, 
     lr: float = 1e-3, 
     use_lr_schedule: bool = False, 
     initial_lr: Optional[float] = 1e-6, 
     n_data: Optional[int] = None,
     n_epochs_warmup: Optional[int] = None,
     diffusion_iterations: Optional[int] = None
-) -> tuple[optax.GradientTransformationExtraArgs, optax.OptState]:
+) -> tuple[
+    optax.GradientTransformationExtraArgs, optax.OptState
+]:
 
     if use_lr_schedule:
         n_steps_per_epoch = int(n_data / n_batch)
@@ -839,6 +974,8 @@ def get_opt_and_state(
 if __name__ == "__main__":
     key = jr.key(int(time.time()))
 
+    save_dir             = "imgs_/"
+
     # Train
     em_iterations        = 64
     diffusion_iterations = 5_000
@@ -852,16 +989,18 @@ if __name__ == "__main__":
     n_epochs_warmup      = 1
     ppca_pretrain        = True
     n_pca_iterations     = 10
-    clip_x_y             = True
+    clip_x_y             = True # Clip sampled latents
+    X_clip_limit         = 4.
     re_init_opt_state    = True
     n_plot               = 8000
+    sampling_mode        = "stochastic" 
     mode                 = "full"
 
     # Model
     width_size           = 256 #128
     depth                = 2 #5
     activation           = jax.nn.gelu # silu 
-    soln_kwargs          = dict(t0=0., dt0=0.05, t1=1., solver=dfx.Euler())
+    soln_kwargs          = dict(t0=0., dt0=0.05, t1=1., solver=dfx.Euler()) # For ODE
     time_embedding_dim   = 8
 
     # Data
@@ -869,6 +1008,8 @@ if __name__ == "__main__":
     n_data               = 100_000
     sigma_y              = 0.2
     cov_y                = jnp.eye(data_dim) * jnp.square(sigma_y)
+
+    assert sampling_mode in ["stochastic", "deterministic"]
 
     key_data, key_measurement, key_net, key_ppca, key_em = jr.split(key, 5)
 
@@ -924,7 +1065,10 @@ if __name__ == "__main__":
             mu_x, cov_x = ppca(X_, key_pca, rank=data_dim)
 
             keys = jr.split(key_sample, n_data)
-            X_ = jax.vmap(get_initial_x_y_sampler(flow, mu_x, cov_x))(keys, Y) 
+            if sampling_mode == "stochastic":
+                X_ = jax.vmap(get_initial_x_y_sampler_ode(flow, mu_x, cov_x))(keys, Y) 
+            if sampling_mode == "deterministic":
+                X_ = jax.vmap(get_initial_x_y_sampler_ddim(flow, mu_x, cov_x))(keys, Y)
 
         print("mu/cov x:", mu_x, cov_x)
     else:
@@ -934,7 +1078,7 @@ if __name__ == "__main__":
     X_test = jax.vmap(get_non_singular_sample_fn(flow))(keys)
 
     # Plot initial samples
-    plot_samples(X, X_, Y, X_test)
+    plot_samples(X, X_, Y, X_test, save_dir=save_dir)
 
     # Expectation maximisation
     losses_k = []
@@ -960,8 +1104,6 @@ if __name__ == "__main__":
 
         # Restart optimiser on previously trained score network
         if re_init_opt_state:
-            # opt_state = opt.init(eqx.filter(flow, eqx.is_array))
-
             opt, opt_state = get_opt_and_state(
                 flow, 
                 optimiser,
@@ -975,18 +1117,22 @@ if __name__ == "__main__":
 
         # Generate latents from q(x|y)
         keys = jr.split(key_sample, n_data)
-        X_ = jax.vmap(get_x_y_sampler(flow, cov_x, cov_y, mode=mode))(keys, Y)
+        if sampling_mode == "stochastic":
+            X_ = jax.vmap(get_x_y_sampler_ddim(flow, cov_x, cov_y, mode=mode))(keys, Y)
+        if sampling_mode == "deterministic":
+            X_ = jax.vmap(get_x_y_sampler_ode(flow, cov_x, cov_y, mode=mode))(keys, Y)
 
         if clip_x_y:
-            X_ = X_[jnp.all(jnp.logical_and(-4. < X_, X_ < 4.), axis=-1)] # Training set gets smaller...
+            X_ = X_[jnp.all(jnp.logical_and(-X_clip_limit < X_, X_ < X_clip_limit), axis=-1)] # Training set gets smaller...
 
+        # Generate latents from q(x)
         X_test = jax.vmap(get_non_singular_sample_fn(flow))(keys)
 
         # Plot latents and losses
-        plot_samples(X, X_, Y, X_test, iteration=k + 1)
+        plot_samples(X, X_, Y, X_test, iteration=k + 1, save_dir=save_dir)
 
         losses_k += losses_i
-        plot_losses(losses_k)
+        plot_losses(losses_k, save_dir=save_dir)
 
         # ...automatically begins next k-iteration with parameters from SGM this iteration
 

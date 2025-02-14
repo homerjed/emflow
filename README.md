@@ -6,6 +6,7 @@ In this implementation I am only dealing with Gaussian noise on the data, perhap
 
 To implement:
 - [x] Flow matching
+- [ ] Stochastic and deterministic posterior sampling
 - [ ] Mixed precision
 - [ ] EMA
 - [ ] Hyperparameter/model saving
