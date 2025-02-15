@@ -13,6 +13,7 @@ from jaxtyping import PRNGKeyArray, Array, Float, Scalar, PyTree, jaxtyped
 from beartype import beartype as typechecker
 
 import matplotlib.pyplot as plt
+from PIL import Image
 from sklearn.datasets import make_moons
 from sklearn.preprocessing import StandardScaler
 from tqdm.auto import trange
@@ -293,8 +294,7 @@ class RectifiedFlow(eqx.Module):
         g_scale: float = 0.1, 
         n_steps: int = 1000,
         n: int = 1, 
-        m: int = 0,
-        q_as_x_1: bool = False
+        m: int = 0
     ) -> Array:
         return single_non_singular_sample_fn(
             self.v, 
@@ -302,8 +302,12 @@ class RectifiedFlow(eqx.Module):
             a=None, 
             key=key, 
             x_shape=self.x_shape, 
-            t0=self.t0, 
-            t1=self.t1
+            t0=default(t0, self.t0), 
+            t1=default(t1, self.t1), 
+            n_steps=n_steps,
+            g_scale=g_scale,
+            m=m,
+            n=n
         )
 
 
@@ -320,8 +324,8 @@ def single_non_singular_sample_fn(
     *,
     g_scale: float = 0.1, 
     n_steps: int = 1000,
-    n: int = 1, 
-    m: int = 0
+    n: float = 1., 
+    m: float = 0.
 ) -> XArray:
     """
         Possibly add score callable for p(y|x)?
@@ -426,6 +430,10 @@ def get_flow_soln_kwargs(flow: RectifiedFlow, reverse: bool = False):
 """
 
 
+def identity(t: Scalar) -> Scalar:
+    return t
+
+
 def cosine_time(t: Scalar) -> Scalar:
     return 1. - (1. / (jnp.tan(0.5 * jnp.pi * t) + 1.)) # t1?
 
@@ -435,12 +443,12 @@ def time_sampler(
     n: int, 
     t0: float, 
     t1: float, 
-    schedule: Optional[Callable[[Scalar], Scalar]] = None
+    time_schedule: Optional[Callable[[Scalar], Scalar]] = None
 ) -> Scalar:
     t = jr.uniform(key, (n,), minval=t0, maxval=t1 / n)
     t = t + (t1 / n) * jnp.arange(n)
-    if exists(schedule):
-        t = schedule(t)
+    if exists(time_schedule):
+        t = time_schedule(t)
     return t
 
 
@@ -455,7 +463,7 @@ def batch_loss_fn(
     key: PRNGKeyArray, 
     *,
     loss_type: Literal["mse", "huber"] = "mse",
-    schedule: Optional[Callable[[Scalar], Scalar]] = cosine_time
+    time_schedule: Optional[Callable[[Scalar], Scalar]] = cosine_time
 ) -> tuple[Scalar, Scalar]:
     """
         Computes MSE between the conditional vector field (x1 - x0)
@@ -465,10 +473,17 @@ def batch_loss_fn(
     key_eps, key_t = jr.split(key)
 
     t = time_sampler(
-        key_t, x_0.shape[0], t0=flow.t0, t1=flow.t1, schedule=schedule
+        key_t, 
+        x_0.shape[0], 
+        t0=flow.t0, 
+        t1=flow.t1, 
+        time_schedule=time_schedule
     )
+
     x_1 = jr.normal(key_eps, x_0.shape) 
+
     x_t = jax.vmap(flow.p_t)(x_0, t, x_1) 
+
     v = jax.vmap(flow.v)(t, x_t) 
 
     if loss_type == "mse":
@@ -486,15 +501,24 @@ def make_step(
     model: RectifiedFlow, 
     x: Array, 
     key: PRNGKeyArray, 
-    opt_state: PyTree, 
+    opt_state: optax.OptState, 
     opt_update: Callable, 
     *,
+    loss_type: Literal["mse", "huber"] = "mse",
+    time_schedule: Callable[[Scalar], Scalar] = identity,
     grad_accumulate: bool = False,
     n_minibatches: int = 4
 ) -> tuple[
-    Scalar, RectifiedFlow, PRNGKeyArray, PyTree
+    Scalar, RectifiedFlow, PRNGKeyArray, optax.OptState
 ]:
-    grad_fn = eqx.filter_value_and_grad(batch_loss_fn, has_aux=True)
+    grad_fn = eqx.filter_value_and_grad(
+        partial(
+            batch_loss_fn, 
+            loss_type=loss_type, 
+            time_schedule=time_schedule
+        ), 
+        has_aux=True
+    )
 
     if grad_accumulate:
         (loss, _), grads,  = accumulate_gradients_scan(
@@ -505,6 +529,7 @@ def make_step(
 
     updates, opt_state = opt_update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
+
     key, _ = jr.split(key)
     return loss, model, key, opt_state
 
@@ -627,14 +652,14 @@ def value_and_jacfwd(
 ) -> tuple[XArray, Covariance]:
     J_fn = partial(jax.jvp, lambda x: f(x, cov, score), (x,)) # NOTE: J[E[x|x_t]] w.r.t. x_t 
     basis = jnp.eye(x.size, dtype=x.dtype)
-    y, jac = jax.vmap(J_fn, out_axes=(None, 1))((basis,))
-    return y, jac
+    y, J = jax.vmap(J_fn, out_axes=(None, 1))((basis,))
+    return y, J
 
 
 @typecheck
-def get_E_x_x_t(x_t: XArray, cov_t: Covariance, score: XArray) -> XArray: 
+def get_E_x_x_t(x_t: XArray, cov_t: Covariance, score_t: XArray) -> XArray: 
     # Convert score to expectation via Tweedie; x_t + cov_t * score[p(x_t)]
-    return x_t + cov_t @ score 
+    return x_t + cov_t @ score_t
 
 
 @typecheck
@@ -660,7 +685,9 @@ def get_score_y_x(
 
     score_x = velocity_to_score(flow, t, x)
 
-    E_x_x_t, dE_x_x_t = value_and_jacfwd(get_E_x_x_t, x, cov=cov_t, score=score_x)
+    E_x_x_t, dE_x_x_t = value_and_jacfwd(
+        get_E_x_x_t, x, cov=cov_t, score=score_x
+    )
 
     V_x_x_t = cov_t @ dE_x_x_t
 
@@ -684,7 +711,9 @@ def get_score_gaussian_x_y(
 
     score_x = x + cov_t @ cov_inv_x @ (x - mu_x) # Tweedie with score of analytic G[x|mu_x, cov_x]
 
-    E_x_x_t, dE_x_x_t = value_and_jacfwd(get_E_x_x_t, x, cov_t, score_x) # Tweedie; mean and jacobian
+    E_x_x_t, dE_x_x_t = value_and_jacfwd(
+        get_E_x_x_t, x, cov=cov_t, score=score_x
+    ) 
     V_x_x_t = cov_t @ dE_x_x_t # Or heuristics; cov_t, inv(cov_t)...
     
     score_y_x = dE_x_x_t @ jnp.linalg.inv(cov_y + V_x_x_t) @ (y_ - E_x_x_t) # Eq 20
@@ -722,10 +751,13 @@ def single_x_y_ddim_sample_fn(
 
     flow = eqx.nn.inference_mode(flow)
 
-    def sample_step(i: Scalar, x_t: XArray) -> tuple[XArray, PRNGKeyArray]:
+    def sample_step(i: Scalar, x_t_key: XArray) -> tuple[XArray, PRNGKeyArray]:
+        x_t, key = x_t_key
+
         s, t = times[i], times[i + 1]
 
-        sigma_s, sigma_t = flow.mu_sigma_t(s)[1], flow.mu_sigma_t(t)[1]
+        sigma_s = flow.mu_sigma_t(s)[1]
+        sigma_t = flow.mu_sigma_t(t)[1]
         cov_t = jnp.eye(y_.size) * jnp.square(sigma_t)
 
         if q_0_sampling:
@@ -844,32 +876,8 @@ def sample_initial_score_ode(
 
 
 """
-    Plots & utils
+    Sampler utils
 """
-
-
-def plot_losses(losses_k, save_dir="imgs/"):
-    losses_k = jnp.asarray(losses_k)
-    losses_k = losses_k[jnp.abs(losses_k - jnp.mean(losses_k)) < 2. * jnp.std(losses_k)]
-    plt.figure()
-    plt.loglog(losses_k)
-    plt.savefig(os.path.join(save_dir, "L.png"))
-    plt.close()
-
-
-def plot_samples(X, X_Y, Y, X_, n_plot=8000, iteration=0, save_dir="imgs/"):
-    fig, axs = plt.subplots(2, 1, figsize=(4., 9.), dpi=200)
-    ax = axs[0]
-    ax.scatter(*X[:n_plot].T, s=0.05, marker=".", color="k", label=r"$x\sim p(x)$")
-    ax.scatter(*X_Y[:n_plot].T, s=0.05, marker=".", color="royalblue", label=r"$x\sim p_{\theta}(x|y)$")
-    ax.scatter(*Y[:n_plot].T, s=0.05, marker=".", color="goldenrod", label=r"$y\sim p(y|x)$")
-    ax.legend(frameon=False)
-    ax = axs[1]
-    ax.scatter(*X[:n_plot].T, s=0.05, marker=".", color="k", label=r"$x\sim p(x)$")
-    ax.scatter(*X_[:n_plot].T, s=0.05, marker=".", color="g", label=r"$x\sim p_{\theta}(x)$")
-    ax.legend(frameon=False)
-    plt.savefig(os.path.join(save_dir, "samples_{:04d}.png".format(iteration)))
-    plt.close()
 
 
 @typecheck
@@ -927,8 +935,59 @@ def get_x_y_sampler_ddim(
 def get_non_singular_sample_fn(
     flow: RectifiedFlow
 ) -> Callable[[PRNGKeyArray], XArray]:
+    # Sampler for e.g. sampling latents from model p(x) without y 
     fn = lambda key: single_non_singular_sample_fn(flow, key=key)
     return fn
+
+
+"""
+    Plots & utils
+"""
+
+
+def plot_losses(losses_k, save_dir="imgs/"):
+    losses_k = jnp.asarray(losses_k)
+    losses_k = losses_k[jnp.abs(losses_k - jnp.mean(losses_k)) < 2. * jnp.std(losses_k)]
+    plt.figure()
+    plt.loglog(losses_k)
+    plt.savefig(os.path.join(save_dir, "L.png"))
+    plt.close()
+
+
+def plot_samples(X, X_Y, Y, X_, n_plot=8000, iteration=0, save_dir="imgs/"):
+    plot_kwargs = dict(s=0.08, marker=".")
+    fig, axs = plt.subplots(2, 1, figsize=(4., 9.), dpi=200)
+    ax = axs[0]
+    ax.scatter(*X[:n_plot].T, color="k", label=r"$x\sim p(x)$", **plot_kwargs)
+    ax.scatter(*X_Y[:n_plot].T, color="b", label=r"$x\sim p_{\theta}(x|y)$", **plot_kwargs) 
+    ax.scatter(*Y[:n_plot].T, color="r", label=r"$y\sim p(y|x)$", **plot_kwargs) 
+    ax = axs[1]
+    ax.scatter(*X[:n_plot].T, color="k", label=r"$x\sim p(x)$", **plot_kwargs) 
+    ax.scatter(*X_[:n_plot].T, color="b", label=r"$x\sim p_{\theta}(x)$", **plot_kwargs) 
+    for ax in axs:
+        ax.legend(frameon=False, loc="upper right")
+        ax.set_xlim(-2.2, 2.2)
+        ax.set_ylim(-2.2, 2.2)
+    plt.savefig(os.path.join(save_dir, "samples_{:04d}.png".format(iteration)))
+    plt.close()
+
+
+def create_gif(image_folder):
+    images = sorted(
+        [
+            os.path.join(image_folder, img) 
+            for img in os.listdir(image_folder) 
+            if img.endswith(("png")) and "L" not in img
+        ]
+    )
+    frames = [Image.open(img) for img in images]
+    frames[0].save(
+        os.path.join(image_folder, "training.gif"), 
+        save_all=True, 
+        append_images=frames[1:], 
+        duration=100, 
+        loop=0
+    )
 
 
 def measurement(key: PRNGKeyArray, x: XArray, cov_y: Covariance) -> XArray: 
@@ -951,7 +1010,6 @@ def get_opt_and_state(
 ) -> tuple[
     optax.GradientTransformationExtraArgs, optax.OptState
 ]:
-
     if use_lr_schedule:
         n_steps_per_epoch = int(n_data / n_batch)
 
@@ -971,6 +1029,10 @@ def get_opt_and_state(
     return opt, opt_state
 
 
+def clip_latents(X, x_clip_limit):
+    return X_[jnp.all(jnp.logical_and(-x_clip_limit < X_, X_ < x_clip_limit), axis=-1)] 
+
+
 if __name__ == "__main__":
     key = jr.key(int(time.time()))
 
@@ -981,7 +1043,7 @@ if __name__ == "__main__":
     diffusion_iterations = 5_000
     n_batch              = 5_000
     loss_type            = "mse"
-    time_schedule        = "cosine" # "linear"
+    time_schedule        = identity
     lr                   = 1e-3
     optimiser            = soap
     use_lr_schedule      = True
@@ -990,18 +1052,18 @@ if __name__ == "__main__":
     ppca_pretrain        = True
     n_pca_iterations     = 10
     clip_x_y             = True # Clip sampled latents
-    X_clip_limit         = 4.
+    x_clip_limit         = 4.
     re_init_opt_state    = True
     n_plot               = 8000
-    sampling_mode        = "stochastic" 
+    sampling_mode        = "deterministic" 
     mode                 = "full"
 
     # Model
     width_size           = 256 #128
-    depth                = 2 #5
+    depth                = 3 #5
     activation           = jax.nn.gelu # silu 
     soln_kwargs          = dict(t0=0., dt0=0.05, t1=1., solver=dfx.Euler()) # For ODE
-    time_embedding_dim   = 8
+    time_embedding_dim   = 32
 
     # Data
     data_dim             = 2
@@ -1064,11 +1126,12 @@ if __name__ == "__main__":
 
             mu_x, cov_x = ppca(X_, key_pca, rank=data_dim)
 
-            keys = jr.split(key_sample, n_data)
             if sampling_mode == "stochastic":
-                X_ = jax.vmap(get_initial_x_y_sampler_ode(flow, mu_x, cov_x))(keys, Y) 
+                sampler = get_initial_x_y_sampler_ddim(flow, mu_x, cov_x)
             if sampling_mode == "deterministic":
-                X_ = jax.vmap(get_initial_x_y_sampler_ddim(flow, mu_x, cov_x))(keys, Y)
+                sampler = get_initial_x_y_sampler_ode(flow, mu_x, cov_x)
+            keys = jr.split(key_sample, n_data)
+            X_ = jax.vmap(sampler)(keys, Y)
 
         print("mu/cov x:", mu_x, cov_x)
     else:
@@ -1096,7 +1159,13 @@ if __name__ == "__main__":
                 x = jr.choice(key_x, X_, (n_batch,)) # Make sure always choosing x ~ p(x|y)
 
                 L, flow, key, opt_state = make_step(
-                    flow, x, key_step, opt_state, opt.update
+                    flow, 
+                    x, 
+                    key_step, 
+                    opt_state, 
+                    opt.update, 
+                    loss_type=loss_type, 
+                    time_schedule=time_schedule
                 )
 
                 losses_i.append(L)
@@ -1116,14 +1185,15 @@ if __name__ == "__main__":
             )
 
         # Generate latents from q(x|y)
-        keys = jr.split(key_sample, n_data)
         if sampling_mode == "stochastic":
-            X_ = jax.vmap(get_x_y_sampler_ddim(flow, cov_x, cov_y, mode=mode))(keys, Y)
+            sampler = get_x_y_sampler_ddim(flow, cov_x, cov_y, mode=mode)
         if sampling_mode == "deterministic":
-            X_ = jax.vmap(get_x_y_sampler_ode(flow, cov_x, cov_y, mode=mode))(keys, Y)
+            sampler = get_x_y_sampler_ode(flow, cov_x, cov_y, mode=mode)
+        keys = jr.split(key_sample, n_data)
+        X_ = jax.vmap(sampler)(keys, Y)
 
         if clip_x_y:
-            X_ = X_[jnp.all(jnp.logical_and(-X_clip_limit < X_, X_ < X_clip_limit), axis=-1)] # Training set gets smaller...
+            X_ = clip_latents(X_, x_clip_limit) 
 
         # Generate latents from q(x)
         X_test = jax.vmap(get_non_singular_sample_fn(flow))(keys)
@@ -1133,6 +1203,9 @@ if __name__ == "__main__":
 
         losses_k += losses_i
         plot_losses(losses_k, save_dir=save_dir)
+
+        if k > 10:
+            create_gif(save_dir)
 
         # ...automatically begins next k-iteration with parameters from SGM this iteration
 
