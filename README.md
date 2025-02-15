@@ -6,11 +6,11 @@ In this implementation I am only dealing with Gaussian noise on the data, perhap
 
 To implement:
 - [x] Flow matching
-- [ ] Stochastic and deterministic posterior sampling
+- [x] Stochastic and deterministic posterior sampling
 - [ ] Mixed precision
 - [ ] EMA
 - [ ] Hyperparameter/model saving
-- [ ] CG data-likelihood calculation
+- [ ] CG data-likelihood calculation ($q_0(x|y)$ as well as $q(x|y)$)
 
 <div align="center">
     <img src="assets/training.gif" width="50%">

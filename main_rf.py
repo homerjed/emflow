@@ -1,6 +1,7 @@
 import time
 import os
 from functools import partial
+from shutil import rmtree
 from typing import Callable, Literal, Optional, Union
 
 import jax
@@ -182,9 +183,9 @@ class RectifiedFlow(eqx.Module):
         time_embedder: Callable,
         *,
         x_shape: tuple[int],
-        t0: float = 0.,
-        dt0: float = 0.01,
-        t1: float = 1.,
+        t0: float,
+        dt0: float,
+        t1: float,
         solver: dfx.AbstractSolver = dfx.Euler()
     ):
         self.net = net
@@ -592,12 +593,22 @@ def accumulate_gradients_scan(
     return metrics, grads
 
 
+"""
+    Data
+"""
+
+
 def get_data(key: PRNGKeyArray, n: int) -> Float[Array, "n 2"]:
     seed = int(jnp.sum(jr.key_data(key)))
     X, _ = make_moons(n, noise=0.04, random_state=seed)
     s = StandardScaler()
     X = s.fit_transform(X)
     return jnp.asarray(X)
+
+
+def measurement(key: PRNGKeyArray, x: XArray, cov_y: Covariance) -> XArray: 
+    # Sample from G[y|x, cov_y]
+    return jr.multivariate_normal(key, x, cov_y) 
 
 
 """
@@ -945,10 +956,20 @@ def get_non_singular_sample_fn(
 """
 
 
-def plot_losses(losses_k, save_dir="imgs/"):
+def clear_and_get_results_dir(save_dir: str) -> str:
+    # Image save directories
+    rmtree(save_dir, ignore_errors=True) # Clear old ones
+    if not save_dir.exists():
+        os.mkdir(save_dir, exist_ok=True)
+    return save_dir 
+
+
+def plot_losses(losses_k, iteration, diffusion_iterations, save_dir="imgs/"):
     losses_k = jnp.asarray(losses_k)
-    losses_k = losses_k[jnp.abs(losses_k - jnp.mean(losses_k)) < 2. * jnp.std(losses_k)]
+    # losses_k = losses_k[jnp.abs(losses_k - jnp.mean(losses_k)) < 2. * jnp.std(losses_k)]
     plt.figure()
+    for i in range(1, iteration + 1):
+        plt.axvline(i * diffusion_iterations, linestyle=":", color="gray")
     plt.loglog(losses_k)
     plt.savefig(os.path.join(save_dir, "L.png"))
     plt.close()
@@ -958,6 +979,7 @@ def plot_samples(X, X_Y, Y, X_, n_plot=8000, iteration=0, save_dir="imgs/"):
     plot_kwargs = dict(s=0.08, marker=".")
     fig, axs = plt.subplots(2, 1, figsize=(4., 9.), dpi=200)
     ax = axs[0]
+    ax.set_title("EM: iteration {}".format(iteration))
     ax.scatter(*X[:n_plot].T, color="k", label=r"$x\sim p(x)$", **plot_kwargs)
     ax.scatter(*X_Y[:n_plot].T, color="b", label=r"$x\sim p_{\theta}(x|y)$", **plot_kwargs) 
     ax.scatter(*Y[:n_plot].T, color="r", label=r"$y\sim p(y|x)$", **plot_kwargs) 
@@ -966,8 +988,9 @@ def plot_samples(X, X_Y, Y, X_, n_plot=8000, iteration=0, save_dir="imgs/"):
     ax.scatter(*X_[:n_plot].T, color="b", label=r"$x\sim p_{\theta}(x)$", **plot_kwargs) 
     for ax in axs:
         ax.legend(frameon=False, loc="upper right")
-        ax.set_xlim(-2.2, 2.2)
-        ax.set_ylim(-2.2, 2.2)
+        ax.set_xlim(-2.5, 2.5)
+        ax.set_ylim(-2.5, 2.5)
+        ax.axis("off")
     plt.savefig(
         os.path.join(save_dir, "samples_{:04d}.png".format(iteration)), 
         bbox_inches="tight"
@@ -992,11 +1015,6 @@ def create_gif(image_folder):
         duration=100, 
         loop=0
     )
-
-
-def measurement(key: PRNGKeyArray, x: XArray, cov_y: Covariance) -> XArray: 
-    # Sample from G[y|x, cov_y]
-    return jr.multivariate_normal(key, x, cov_y) 
 
 
 def get_opt_and_state(
@@ -1034,13 +1052,14 @@ def get_opt_and_state(
 
 
 def clip_latents(X, x_clip_limit):
-    return X_[jnp.all(jnp.logical_and(-x_clip_limit < X_, X_ < x_clip_limit), axis=-1)] 
+    return X[jnp.all(jnp.logical_and(-x_clip_limit < X, X < x_clip_limit), axis=-1)] 
 
 
 if __name__ == "__main__":
     key = jr.key(int(time.time()))
 
-    save_dir             = "imgs_/"
+    save_dir             = clear_and_get_results_dir(save_dir="imgs_/")
+
 
     # Train
     em_iterations        = 64
@@ -1053,7 +1072,7 @@ if __name__ == "__main__":
     use_lr_schedule      = True
     initial_lr           = 1e-6
     n_epochs_warmup      = 1
-    ppca_pretrain        = True
+    ppca_pretrain        = False # True
     n_pca_iterations     = 10
     clip_x_y             = True # Clip sampled latents
     x_clip_limit         = 4.
@@ -1117,10 +1136,10 @@ if __name__ == "__main__":
     Y = jax.vmap(partial(measurement, cov_y=cov_y))(keys, X) 
 
     # PPCA pre-training for q_0(x|mu_x, cov_x)
+    mu_x = jnp.zeros(data_dim)
+    cov_x = jnp.identity(data_dim) # Start at cov_y?
     if ppca_pretrain:
         # Initial parameters
-        mu_x = jnp.zeros(data_dim)
-        cov_x = jnp.identity(data_dim) # Start at cov_y?
 
         X_ = Y
         for s in trange(
@@ -1206,9 +1225,9 @@ if __name__ == "__main__":
         plot_samples(X, X_, Y, X_test, iteration=k + 1, save_dir=save_dir)
 
         losses_k += losses_i
-        plot_losses(losses_k, save_dir=save_dir)
+        plot_losses(losses_k, k, diffusion_iterations, save_dir=save_dir)
 
-        if k > 10:
+        if k > 1:
             create_gif(save_dir)
 
         # ...automatically begins next k-iteration with parameters from SGM this iteration
