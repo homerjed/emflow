@@ -973,6 +973,7 @@ def plot_samples(X, X_Y, Y, X_, n_plot=8000, iteration=0, save_dir="imgs/"):
 
 
 def create_gif(image_folder):
+    # Animate training iterations 
     images = sorted(
         [
             os.path.join(image_folder, img) 

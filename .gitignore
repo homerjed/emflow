@@ -1,4 +1,7 @@
 __pycache__/
 *.eqx
 *.pdf
+*.gif
 imgs/
+imgs_/
+!assets/

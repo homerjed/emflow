@@ -12,6 +12,8 @@ To implement:
 - [ ] Hyperparameter/model saving
 - [ ] CG data-likelihood calculation
 
+![Training](assets/training.gif)
+
 ```bibtex
 @misc{rozet2024learningdiffusionpriorsobservations,
       title={Learning Diffusion Priors from Observations by Expectation Maximization}, 
