@@ -4,4 +4,4 @@ __pycache__/
 *.gif
 imgs/
 imgs_/
-!assets/
+!assets/*.gif
