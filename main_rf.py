@@ -968,7 +968,10 @@ def plot_samples(X, X_Y, Y, X_, n_plot=8000, iteration=0, save_dir="imgs/"):
         ax.legend(frameon=False, loc="upper right")
         ax.set_xlim(-2.2, 2.2)
         ax.set_ylim(-2.2, 2.2)
-    plt.savefig(os.path.join(save_dir, "samples_{:04d}.png".format(iteration)))
+    plt.savefig(
+        os.path.join(save_dir, "samples_{:04d}.png".format(iteration)), 
+        bbox_inches="tight"
+    )
     plt.close()
 
 

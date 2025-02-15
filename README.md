@@ -12,9 +12,9 @@ To implement:
 - [ ] Hyperparameter/model saving
 - [ ] CG data-likelihood calculation
 
-<!-- ![Training](assets/training.gif) -->
-<img src="assets/training.gif" width="50%">
-<!-- <img src="" width="" height="40" /> -->
+<div align="center">
+    <img src="assets/training.gif" width="50%">
+</div>
 
 ```bibtex
 @misc{rozet2024learningdiffusionpriorsobservations,
