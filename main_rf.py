@@ -1,5 +1,6 @@
 import time
 import os
+from copy import deepcopy
 from functools import partial
 from shutil import rmtree
 from typing import Callable, Literal, Optional, Union
@@ -18,6 +19,7 @@ from PIL import Image
 from sklearn.datasets import make_moons
 from sklearn.preprocessing import StandardScaler
 from tqdm.auto import trange
+import tensorflow_probability.substrates.jax.distributions as tfd
 
 from utils import ppca
 from soap import soap
@@ -140,7 +142,6 @@ class ResidualNetwork(eqx.Module):
         for l, d in zip(self.layers, self.dropouts):
             # Condition on time at each layer
             hqat = jnp.concatenate([h, t] + _qa)
-
             h = l(hqat)
             h = d(h, key=key)
             h = self.activation(h)
@@ -152,13 +153,17 @@ def get_timestep_embedding(t: Scalar, embedding_dim: int):
     # Convert scalar timesteps to an array NOTE: do these arrays get optimised?
     assert embedding_dim % 2 == 0
     if jnp.isscalar(t):
-        t= jnp.array(t)
-    t *= 1000.
-    half_dim = embedding_dim // 2
-    emb = jnp.log(10_000.) / (half_dim - 1.)
-    emb = jnp.exp(jnp.arange(half_dim) * -emb)
-    emb = t * emb
-    emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)])
+        t = jnp.asarray(t)
+    # t *= 1000.
+    # half_dim = int(embedding_dim / 2)
+    # emb = jnp.log(10_000.) / (half_dim - 1.)
+    # emb = jnp.exp(jnp.arange(half_dim) * -emb)
+    # emb = t * emb
+    # emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)])
+
+    freqs = jnp.linspace(0., 1., int(embedding_dim / 2))
+    freqs = (1. / 1.e4) ** freqs
+    emb = jnp.concatenate([jnp.sin(freqs * t), jnp.cos(freqs * t)])
     return emb
 
 
@@ -204,7 +209,7 @@ class RectifiedFlow(eqx.Module):
 
     @typecheck
     def alpha(self, t: Scalar) -> Scalar:
-        return 1. - t # t1?
+        return 1. - t #self.t1 - t 
 
     @typecheck
     def sigma(self, t: Scalar) -> Scalar:
@@ -273,7 +278,7 @@ class RectifiedFlow(eqx.Module):
     def sample_with_score(
         self, 
         key: PRNGKeyArray, 
-        xy_score: Array, 
+        y_x_score: Array, 
         soln_kwargs: Optional[dict] = None
     ) -> Array:
         # xy_score = score[p(y|x)]
@@ -281,7 +286,7 @@ class RectifiedFlow(eqx.Module):
             self, 
             key, 
             self.x_shape, 
-            xy_score=xy_score, 
+            y_x_score=y_x_score, 
             **default(soln_kwargs, self.soln_kwargs)
         )
 
@@ -382,14 +387,14 @@ def single_non_singular_sample_fn(
 def single_score_sample_fn(
     flow: RectifiedFlow, 
     key: PRNGKeyArray, 
-    xy_score: Optional[XArray] = None,
+    y_x_score: Optional[XArray] = None,
 ) -> XArray:
     flow = eqx.nn.inference_mode(flow, True)
 
     def _flow(t, x, args):
         score_x = velocity_to_score(flow, t, x) #(-(1. - t) * flow.v(t, x) - x) / t
-        if xy_score is not None:
-            score_x_y = score_x + xy_score
+        if y_x_score is not None:
+            score_x_y = score_x + y_x_score
         return score_x_y
     
     y1 = jr.normal(key, flow.x_shape)
@@ -429,6 +434,21 @@ def get_flow_soln_kwargs(flow: RectifiedFlow, reverse: bool = False):
 """
     Train
 """
+
+
+def apply_ema(
+    ema_model: eqx.Module, 
+    model: eqx.Module, 
+    ema_rate: float, 
+    # policy: Optional[Policy] = None
+) -> eqx.Module:
+    # if exists(policy):
+    #     model = policy.cast_to_param(model)
+    ema_fn = lambda p_ema, p: p_ema * ema_rate + p * (1. - ema_rate)
+    m_, _m = eqx.partition(model, eqx.is_inexact_array) # Current model params
+    e_, _e = eqx.partition(ema_model, eqx.is_inexact_array) # Old EMA params
+    e_ = jax.tree_util.tree_map(ema_fn, e_, m_) # New EMA params
+    return eqx.combine(e_, _m)
 
 
 def identity(t: Scalar) -> Scalar:
@@ -600,7 +620,27 @@ def accumulate_gradients_scan(
 
 def get_data(key: PRNGKeyArray, n: int) -> Float[Array, "n 2"]:
     seed = int(jnp.sum(jr.key_data(key)))
-    X, _ = make_moons(n, noise=0.04, random_state=seed)
+    # X, _ = make_moons(n, noise=0.04, random_state=seed)
+
+    N = 8 # Mixture components
+    alphas = jnp.linspace(0, 2. * jnp.pi * (1. - 1. / N), N)
+    xs = jnp.cos(alphas)
+    ys = jnp.sin(alphas)
+    means = jnp.stack([xs, ys], axis=1)
+
+    gaussian_mixture = tfd.Mixture(
+        cat=tfd.Categorical(
+            probs=jnp.ones((means.shape[0])) / means.shape[0]
+        ),
+        components=[
+            tfd.MultivariateNormalDiag(
+                loc=mu, scale_diag=jnp.ones_like(mu) * 0.1
+            )
+            for mu in means
+        ]
+    )
+    X = gaussian_mixture.sample((n,), seed=key)
+
     s = StandardScaler()
     X = s.fit_transform(X)
     return jnp.asarray(X)
@@ -696,13 +736,14 @@ def get_score_y_x(
 
     score_x = velocity_to_score(flow, t, x)
 
-    E_x_x_t, dE_x_x_t = value_and_jacfwd(
+    E_x_x_t, J_E_x_x_t = value_and_jacfwd(
         get_E_x_x_t, x, cov=cov_t, score=score_x
     )
 
-    V_x_x_t = cov_t @ dE_x_x_t
+    V_x_x_t = cov_t @ J_E_x_x_t
+    V_y_x_t = cov_y + V_x_x_t
 
-    score_y_x = dE_x_x_t @ jnp.linalg.inv(cov_y + V_x_x_t) @ (y_ - E_x_x_t) # Eq 20, 22
+    score_y_x = J_E_x_x_t.T @ jnp.linalg.inv(V_y_x_t) @ (y_ - E_x_x_t) # Eq 20, 22
 
     if return_score_x:
         return score_y_x, score_x
@@ -722,12 +763,12 @@ def get_score_gaussian_x_y(
 
     score_x = x + cov_t @ cov_inv_x @ (x - mu_x) # Tweedie with score of analytic G[x|mu_x, cov_x]
 
-    E_x_x_t, dE_x_x_t = value_and_jacfwd(
+    E_x_x_t, J_E_x_x_t = value_and_jacfwd(
         get_E_x_x_t, x, cov=cov_t, score=score_x
     ) 
-    V_x_x_t = cov_t @ dE_x_x_t # Or heuristics; cov_t, inv(cov_t)...
+    V_x_x_t = cov_t @ J_E_x_x_t # Or heuristics; cov_t, inv(cov_t)...
     
-    score_y_x = dE_x_x_t @ jnp.linalg.inv(cov_y + V_x_x_t) @ (y_ - E_x_x_t) # Eq 20
+    score_y_x = J_E_x_x_t.T @ jnp.linalg.inv(cov_y + V_x_x_t) @ (y_ - E_x_x_t) # Eq 20
 
     score_x_y = score_y_x + score_x
 
@@ -844,6 +885,7 @@ def single_x_y_sample_fn_ode(
 def sample_initial_score_ode(
     mu_x: XArray, 
     cov_x: Covariance, 
+    cov_y: Covariance,
     flow: RectifiedFlow, 
     key: PRNGKeyArray, 
     y_: XArray
@@ -861,9 +903,10 @@ def sample_initial_score_ode(
         cov_y: Covariance
     ) -> XArray:
         # Score of Gaussian kernel centred on data NOTE: mode="Gaussian" for init
-        E_x_x_t, dE_x_x_t = value_and_jacfwd(get_E_x_x_t, x, cov_t, score) # Tweedie; mean and jacobian
-        V_x_x_t = cov_t @ dE_x_x_t # Or heuristics; cov_t, inv(cov_t)...
-        return dE_x_x_t @ jnp.linalg.inv(cov_y + V_x_x_t) @ (y_ - E_x_x_t) # Eq 20
+        E_x_x_t, J_E_x_x_t = value_and_jacfwd(get_E_x_x_t, x, cov_t, score) # Tweedie; mean and jacobian
+        V_x_x_t = cov_t @ J_E_x_x_t # Or heuristics; cov_t, inv(cov_t)...
+        V_y_x_t = cov_y + V_x_x_t
+        return J_E_x_x_t.T @ jnp.linalg.inv(V_y_x_t) @ (y_ - E_x_x_t) # Eq 20
 
     def reverse_ode(t, x, args):
         # Sampling along conditional score p(x|y)
@@ -895,10 +938,11 @@ def sample_initial_score_ode(
 def get_initial_x_y_sampler_ode(
     flow: RectifiedFlow, 
     mu_x: XArray, 
-    cov_x: Covariance
+    cov_x: Covariance,
+    cov_y: Covariance
 ) -> Callable[[PRNGKeyArray, XArray], XArray]:
     fn = lambda key, y_: sample_initial_score_ode(
-        mu_x, cov_x, flow, key, y_
+        mu_x, cov_x, cov_y, flow, key, y_
     )
     return fn
 
@@ -921,10 +965,11 @@ def get_initial_x_y_sampler_ddim(
     flow: RectifiedFlow, 
     mu_x: XArray, 
     cov_x: Covariance,
+    cov_y: Covariance,
     mode: Literal["full", "cg"] = "full"
 ) -> Callable[[PRNGKeyArray, XArray], XArray]:
     fn = lambda key, y_: single_x_y_ddim_sample_fn(
-        mu_x, cov_x, flow, key, y_, q_0_sampling=True, mode=mode
+        mu_x, cov_x, cov_y, flow, key, y_, q_0_sampling=True, mode=mode
     )
     return fn
 
@@ -959,8 +1004,8 @@ def get_non_singular_sample_fn(
 def clear_and_get_results_dir(save_dir: str) -> str:
     # Image save directories
     rmtree(save_dir, ignore_errors=True) # Clear old ones
-    if not save_dir.exists():
-        os.mkdir(save_dir, exist_ok=True)
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir, exist_ok=True)
     return save_dir 
 
 
@@ -971,6 +1016,8 @@ def plot_losses(losses_k, iteration, diffusion_iterations, save_dir="imgs/"):
     for i in range(1, iteration + 1):
         plt.axvline(i * diffusion_iterations, linestyle=":", color="gray")
     plt.loglog(losses_k)
+    plt.ylabel(r"$\mathcal{L}$")
+    plt.xlabel(r"$n_{steps}$")
     plt.savefig(os.path.join(save_dir, "L.png"))
     plt.close()
 
@@ -983,11 +1030,17 @@ def plot_samples(X, X_Y, Y, X_, n_plot=8000, iteration=0, save_dir="imgs/"):
     ax.scatter(*X[:n_plot].T, color="k", label=r"$x\sim p(x)$", **plot_kwargs)
     ax.scatter(*X_Y[:n_plot].T, color="b", label=r"$x\sim p_{\theta}(x|y)$", **plot_kwargs) 
     ax.scatter(*Y[:n_plot].T, color="r", label=r"$y\sim p(y|x)$", **plot_kwargs) 
+    legend = ax.legend(frameon=False, loc="upper right")
+    legend.get_texts()[0].set_color("k") 
+    legend.get_texts()[1].set_color("b") 
+    legend.get_texts()[2].set_color("r") 
     ax = axs[1]
     ax.scatter(*X[:n_plot].T, color="k", label=r"$x\sim p(x)$", **plot_kwargs) 
     ax.scatter(*X_[:n_plot].T, color="b", label=r"$x\sim p_{\theta}(x)$", **plot_kwargs) 
+    legend = ax.legend(frameon=False, loc="upper right")
+    legend.get_texts()[0].set_color("k") 
+    legend.get_texts()[1].set_color("b") 
     for ax in axs:
-        ax.legend(frameon=False, loc="upper right")
         ax.set_xlim(-2.5, 2.5)
         ax.set_ylim(-2.5, 2.5)
         ax.axis("off")
@@ -1012,7 +1065,7 @@ def create_gif(image_folder):
         os.path.join(image_folder, "training.gif"), 
         save_all=True, 
         append_images=frames[1:], 
-        duration=100, 
+        duration=500, 
         loop=0
     )
 
@@ -1058,7 +1111,7 @@ def clip_latents(X, x_clip_limit):
 if __name__ == "__main__":
     key = jr.key(int(time.time()))
 
-    save_dir             = clear_and_get_results_dir(save_dir="imgs_/")
+    save_dir             = clear_and_get_results_dir(save_dir="imgs__/")
 
 
     # Train
@@ -1072,18 +1125,20 @@ if __name__ == "__main__":
     use_lr_schedule      = True
     initial_lr           = 1e-6
     n_epochs_warmup      = 1
-    ppca_pretrain        = False # True
+    ppca_pretrain        = True
     n_pca_iterations     = 10
     clip_x_y             = True # Clip sampled latents
     x_clip_limit         = 4.
     re_init_opt_state    = True
-    n_plot               = 8000
+    n_plot               = 10_000
     sampling_mode        = "deterministic" 
-    mode                 = "full"
+    mode                 = "full" # CG mode or not
+    use_ema              = True
+    ema_rate             = 0.9995
 
     # Model
     width_size           = 256 #128
-    depth                = 3 #5
+    depth                = 2 #5
     activation           = jax.nn.gelu # silu 
     soln_kwargs          = dict(t0=0., dt0=0.05, t1=1., solver=dfx.Euler()) # For ODE
     time_embedding_dim   = 32
@@ -1091,7 +1146,7 @@ if __name__ == "__main__":
     # Data
     data_dim             = 2
     n_data               = 100_000
-    sigma_y              = 0.2
+    sigma_y              = 0.0001
     cov_y                = jnp.eye(data_dim) * jnp.square(sigma_y)
 
     assert sampling_mode in ["stochastic", "deterministic"]
@@ -1116,6 +1171,9 @@ if __name__ == "__main__":
         net, time_embedder, x_shape=(data_dim,), **soln_kwargs
     )
 
+    if use_ema:
+        ema_flow = deepcopy(flow)
+
     # opt_state = opt.init(eqx.filter(flow, eqx.is_array))
     opt, opt_state = get_opt_and_state(
         flow, 
@@ -1139,7 +1197,6 @@ if __name__ == "__main__":
     mu_x = jnp.zeros(data_dim)
     cov_x = jnp.identity(data_dim) # Start at cov_y?
     if ppca_pretrain:
-        # Initial parameters
 
         X_ = Y
         for s in trange(
@@ -1150,9 +1207,9 @@ if __name__ == "__main__":
             mu_x, cov_x = ppca(X_, key_pca, rank=data_dim)
 
             if sampling_mode == "stochastic":
-                sampler = get_initial_x_y_sampler_ddim(flow, mu_x, cov_x)
+                sampler = get_initial_x_y_sampler_ddim(flow, mu_x, cov_x, cov_y)
             if sampling_mode == "deterministic":
-                sampler = get_initial_x_y_sampler_ode(flow, mu_x, cov_x)
+                sampler = get_initial_x_y_sampler_ode(flow, mu_x, cov_x, cov_y)
             keys = jr.split(key_sample, n_data)
             X_ = jax.vmap(sampler)(keys, Y)
 
@@ -1191,6 +1248,9 @@ if __name__ == "__main__":
                     time_schedule=time_schedule
                 )
 
+                if use_ema:
+                    ema_flow = apply_ema(ema_flow, flow, ema_rate)
+
                 losses_i.append(L)
                 steps.set_postfix_str(f"\r {k=:04d} {L=:.3E}")
 
@@ -1209,9 +1269,13 @@ if __name__ == "__main__":
 
         # Generate latents from q(x|y)
         if sampling_mode == "stochastic":
-            sampler = get_x_y_sampler_ddim(flow, cov_x, cov_y, mode=mode)
+            sampler = get_x_y_sampler_ddim(
+                ema_flow if use_ema else flow, cov_x, cov_y, mode=mode
+            )
         if sampling_mode == "deterministic":
-            sampler = get_x_y_sampler_ode(flow, cov_x, cov_y, mode=mode)
+            sampler = get_x_y_sampler_ode(
+                ema_flow if use_ema else flow, cov_x, cov_y, mode=mode
+            )
         keys = jr.split(key_sample, n_data)
         X_ = jax.vmap(sampler)(keys, Y)
 
@@ -1219,7 +1283,7 @@ if __name__ == "__main__":
             X_ = clip_latents(X_, x_clip_limit) 
 
         # Generate latents from q(x)
-        X_test = jax.vmap(get_non_singular_sample_fn(flow))(keys)
+        X_test = jax.vmap(get_non_singular_sample_fn(ema_flow if use_ema else flow))(keys)
 
         # Plot latents and losses
         plot_samples(X, X_, Y, X_test, iteration=k + 1, save_dir=save_dir)
@@ -1232,8 +1296,8 @@ if __name__ == "__main__":
 
         # ...automatically begins next k-iteration with parameters from SGM this iteration
 
-# score_y_x = dE_x_x_t.T @ jnp.linalg.inv(cov_y + cov_t @ dE_x_x_t) @ (y_ - E_x_x_t) # Eq 20, 22
-# return dE_x_x_t.T @ jnp.linalg.inv(cov_y + V_x_x_t) @ (y_ - E_x_x_t) # Eq 20
+# score_y_x = J_E_x_x_t.T @ jnp.linalg.inv(cov_y + cov_t @ J_E_x_x_t) @ (y_ - E_x_x_t) # Eq 20, 22
+# return J_E_x_x_t.T @ jnp.linalg.inv(cov_y + V_x_x_t) @ (y_ - E_x_x_t) # Eq 20
 
     # opt                  = optax.chain(optax.clip_by_global_norm(1.), optax.adamw(1e-3))
     # opt                  = optax.chain(optax.clip_by_global_norm(1.), soap(1e-3)) # NOTE: schedule?
