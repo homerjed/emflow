@@ -8,7 +8,7 @@ To implement:
 - [x] Flow matching
 - [x] Stochastic and deterministic posterior sampling
 - [ ] Mixed precision
-- [ ] EMA
+- [x] EMA
 - [ ] Hyperparameter/model saving
 - [ ] CG data-likelihood calculation ($q_0(x|y)$ as well as $q(x|y)$)
 
