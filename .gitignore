@@ -4,4 +4,6 @@ __pycache__/
 *.gif
 imgs/
 imgs_/
+*.png
+*.yml
 !assets/*.gif
