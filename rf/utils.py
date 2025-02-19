@@ -14,8 +14,12 @@ import matplotlib.pyplot as plt
 from sklearn.datasets import make_moons
 from sklearn.preprocessing import StandardScaler
 import tensorflow_probability.substrates.jax.distributions as tfd
+from tqdm import trange
 
-from custom_types import XArray, XCovariance, Datasets, typecheck
+from custom_types import (
+    XArray, XCovariance, SDEType, 
+    SampleType, Datasets, typecheck
+)
 
 EPS = None
 
@@ -38,53 +42,6 @@ def maybe_invert(cov_x):
     else:
         inv_cov_x = None
     return inv_cov_x
-
-
-def gaussian_log_prob(x, mu_x, cov_x):
-    return jax.scipy.stats.multivariate_normal.logpdf(x, mu_x, cov_x)
-
-
-@typecheck
-@eqx.filter_jit
-def ppca(
-    x: Float[Array, "n 2"], 
-    key: PRNGKeyArray, 
-    rank: int 
-) -> tuple[XArray, XCovariance]:
-    # Probabilistic PCA
-
-    samples, features = x.shape
-
-    mu_x = jnp.mean(x, axis=0)
-    x = x - mu_x
-
-    if samples < features:
-        C = x @ x.T / samples
-    else:
-        C = x.T @ x / samples # Sample covariance
-
-    if rank < len(C) // 5:
-        Q = jr.normal(key, (len(C), rank))
-        L, Q, _ = jax.experimental.sparse.linalg.lobpcg_standard(C, Q)
-    else:
-        L, Q = jnp.linalg.eigh(C)
-        L, Q = L[-rank:], Q[:, -rank:]
-
-    if samples < features:
-        Q = x.T @ Q
-        Q = Q / jnp.linalg.norm(Q, axis=0)
-
-    if rank < features:
-        D = (jnp.trace(C) - jnp.sum(L)) / (features - rank)
-    else:
-        D = jnp.asarray(1e-6)
-
-    # U = Q * jnp.sqrt(jnp.maximum(L - D, 0.0))
-
-    # cov_x = jnp.cov(D, rowvar=False)
-    # cov_x = DPLR(D * jnp.ones(features), U, U.T)
-
-    return mu_x, C #jnp.eye(features) * D #C # cov_x
 
 
 """

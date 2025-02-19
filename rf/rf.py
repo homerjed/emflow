@@ -1,3 +1,4 @@
+import math
 from typing import Callable, Literal, Optional, Union
 
 import jax
@@ -9,6 +10,8 @@ from jaxtyping import PRNGKeyArray, Array, Float, Scalar
 
 from custom_types import XArray, SDEType, typecheck
 from utils import exists, maybe_clip
+from resnet import ResidualNetwork
+from dit import DiT
 
 
 def identity(t: Scalar) -> Scalar:
@@ -19,122 +22,14 @@ def cosine_time(t: Scalar) -> Scalar:
     return 1. - (1. / (jnp.tan(0.5 * jnp.pi * t) + 1.)) # t1?
 
 
-class Linear(eqx.Module):
-    weight: Array
-    bias: Array
-
-    def __init__(
-        self, 
-        in_size: int, 
-        out_size: int, 
-        *, 
-        key: PRNGKeyArray 
-    ):
-        lim = jnp.sqrt(1. / (in_size + 1.))
-        key_w, _ = jr.split(key)
-        self.weight = jr.truncated_normal(
-            key_w, shape=(out_size, in_size), lower=-2., upper=2.
-        ) * lim
-        self.bias = jnp.zeros((out_size,))
-
-    def __call__(self, x: XArray) -> XArray:
-        return self.weight @ x + self.bias
-
-
-class ResidualNetwork(eqx.Module):
-    _in: Linear
-    layers: tuple[Linear]
-    dropouts: tuple[eqx.nn.Dropout]
-    _out: Linear
-    activation: Callable
-    q_dim: Optional[int] = None
-    a_dim: Optional[int] = None
-    t1: float
-
-    @typecheck
-    def __init__(
-        self, 
-        in_size: int, 
-        width_size: int, 
-        depth: Optional[int], 
-        q_dim: Optional[int] = None,
-        a_dim: Optional[int] = None, 
-        activation: Callable = jax.nn.tanh,
-        dropout_p: float = 0.,
-        t1: float = 1.,
-        t_embedding_dim: int = 1,
-        *, 
-        key: PRNGKeyArray
-    ):
-        in_key, *net_keys, out_key = jr.split(key, 2 + depth)
-
-        _in_size = in_size + t_embedding_dim # TODO: time embedding
-        if q_dim is not None:
-            _in_size += q_dim
-        if a_dim is not None:
-            _in_size += a_dim
-
-        _width_size = width_size + t_embedding_dim # TODO: time embedding
-        if q_dim is not None:
-            _width_size += q_dim
-        if a_dim is not None:
-            _width_size += a_dim
-
-        self._in = Linear(_in_size,width_size, key=in_key)
-        layers = [
-            Linear(_width_size, width_size, key=_key)
-            for _key in net_keys 
-        ]
-        self._out = Linear(width_size, in_size, key=out_key)
-        self.layers = tuple(layers)
-
-        dropouts = [
-            eqx.nn.Dropout(p=dropout_p) for _ in layers
-        ]
-        self.dropouts = tuple(dropouts)
-
-        self.activation = activation
-        self.q_dim = q_dim
-        self.a_dim = a_dim
-        self.t1 = t1
-    
-    def __call__(
-        self, 
-        t: Scalar, 
-        x: XArray, 
-        q: Optional[Array] = None, 
-        a: Optional[Array] = None, 
-        *, 
-        key: Optional[PRNGKeyArray] = None
-    ) -> XArray:
-        t = jnp.atleast_1d(t / self.t1)
-
-        _qa = []
-        if q is not None and self.q_dim is not None:
-            _qa.append(q)
-        if a is not None and self.a_dim is not None:
-            _qa.append(a)
-
-        xqat = jnp.concatenate([x, t] + _qa)
-        
-        h0 = self._in(xqat)
-        h = h0
-        for l, d in zip(self.layers, self.dropouts):
-            # Condition on time at each layer
-            hqat = jnp.concatenate([h, t] + _qa)
-            h = l(hqat)
-            h = d(h, key=key)
-            h = self.activation(h)
-        o = self._out(h0 + h)
-        return o
-
-
 def get_timestep_embedding(embedding_dim: int) -> Callable[[Scalar], Float[Array, "e"]]:
     def embedding(t: Scalar) -> Float[Array, "e"]:
         # Convert scalar timesteps to an array NOTE: do these arrays get optimised?
         assert embedding_dim % 2 == 0
+
         if jnp.isscalar(t):
             t = jnp.asarray(t)
+
         # t *= 1000.
         # half_dim = int(embedding_dim / 2)
         # emb = jnp.log(10_000.) / (half_dim - 1.)
@@ -145,7 +40,9 @@ def get_timestep_embedding(embedding_dim: int) -> Callable[[Scalar], Float[Array
         freqs = jnp.linspace(0., 1., int(embedding_dim / 2))
         freqs = (1. / 1.e4) ** freqs
         emb = jnp.concatenate([jnp.sin(freqs * t), jnp.cos(freqs * t)])
+
         return emb
+
     return embedding
 
 
@@ -158,6 +55,7 @@ class RectifiedFlow(eqx.Module):
     net: eqx.Module
     time_embedder: Callable
     x_shape: tuple[int]
+    x_dim: int
     t0: float
     dt0: float
     t1: float
@@ -178,6 +76,7 @@ class RectifiedFlow(eqx.Module):
         self.net = net
         self.time_embedder = time_embedder
         self.x_shape = x_shape
+        self.x_dim = math.prod(x_shape)
         self.t0 = t0
         self.dt0 = dt0
         self.t1 = t1
@@ -191,11 +90,15 @@ class RectifiedFlow(eqx.Module):
 
     @typecheck
     def alpha(self, t: Scalar) -> Scalar:
-        return jnp.maximum(1. - t, 1e-5) # 1. - t #self.t1 - t 
+        return jnp.maximum(1. - t, 1e-5) 
 
     @typecheck
     def sigma(self, t: Scalar) -> Scalar:
-        return jnp.maximum(t, 1e-5) # t * (EPS - 1) - EPS
+        return jnp.maximum(t, 1e-5) 
+
+    @typecheck
+    def cov(self, t: Scalar) -> Float[Array, "_ _"]:
+        return jnp.identity(self.x_dim) * jnp.square(jnp.maximum(t, 1e-5))
 
     @typecheck
     def p_t(self, x_0: XArray, t: Scalar, eps: XArray) -> XArray:

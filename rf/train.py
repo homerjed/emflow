@@ -200,3 +200,55 @@ def accumulate_gradients_scan(
     grads = jax.tree.map(lambda g: g / n_minibatches, grads)
     metrics = jax.tree.map(lambda m: m / n_minibatches, metrics)
     return metrics, grads
+
+
+def test_train(key, flow, X, n_batch, diffusion_iterations, use_ema, sde_type, save_dir):
+    # Test whether training config fits FM model on latents
+
+    # jax.config.update("jax_debug_nans", True)
+    # jax.config.update('jax_disable_jit', True)
+
+    opt, opt_state = get_opt_and_state(flow, soap, lr=1e-3)
+
+    if use_ema:
+        ema_flow = deepcopy(flow)
+
+    key_steps, key_sample = jr.split(key)
+
+    losses_s = []
+    with trange(
+        diffusion_iterations, desc="Training (test)", colour="red"
+    ) as steps:
+        for s in steps:
+            key_x, key_step = jr.split(jr.fold_in(key_steps, s))
+
+            x = jr.choice(key_x, X, (n_batch,)) # Make sure always choosing x ~ p(x|y)
+
+            L, flow, key, opt_state = make_step(
+                flow, 
+                x, 
+                key_step, 
+                opt_state, 
+                opt.update, 
+                loss_type="mse", 
+                time_schedule=identity
+            )
+
+            if use_ema:
+                ema_flow = apply_ema(ema_flow, flow, ema_rate)
+
+            losses_s.append(L)
+            steps.set_postfix_str("L={:.3E}".format(L))
+
+    # Generate latents from q(x)
+    keys = jr.split(key_sample, 8000)
+    X_test_sde = jax.vmap(get_non_singular_sample_fn(flow))(keys)
+    X_test_ode = jax.vmap(partial(single_sample_fn_ode, flow, sde_type=sde_type))(keys)
+
+    plt.figure(figsize=(5., 5.))
+    plt.scatter(*X.T, s=0.1, color="k")
+    plt.scatter(*X_test_sde.T, s=0.1, color="b", label="sde")
+    plt.scatter(*X_test_ode.T, s=0.1, color="r", label="ode {}".format(sde_type))
+    plt.legend(frameon=False)
+    plt.savefig(os.path.join(save_dir, "test.png"))
+    plt.close()
