@@ -10,7 +10,7 @@ from jaxtyping import PRNGKeyArray, Array, Float, Scalar, PyTree, jaxtyped
 from beartype import beartype as typechecker
 
 from rf import RectifiedFlow
-from ..utils import exists
+from utils import exists
 
 typecheck = jaxtyped(typechecker=typechecker)
 

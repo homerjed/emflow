@@ -14,11 +14,13 @@ from sklearn.datasets import make_moons
 from sklearn.preprocessing import StandardScaler
 # import tensorflow_probability.substrates.jax.distributions as tfd
 
-from sgm import XArray, Covariance
+XArray = Float[Array, "2"]
+
+XCovariance = Float[Array, "2 2"]
 
 typecheck = jaxtyped(typechecker=typechecker)
 
-EPS = 1e-8 # 1e-3 # Stop diving by zero with alpha_t, 1 - t, ...
+EPS = 1e-10 
 
 
 def exists(v):
@@ -41,11 +43,17 @@ def maybe_invert(cov_x):
     return inv_cov_x
 
 
+def gaussian_log_prob(x, mu_x, cov_x):
+    return jax.scipy.stats.multivariate_normal.logpdf(x, mu_x, cov_x)
+
+
 @typecheck
 @eqx.filter_jit
 def ppca(
-    x: Float[Array, "n 2"], key: PRNGKeyArray, rank: int = 1
-) -> tuple[XArray, Covariance]:
+    x: Float[Array, "n 2"], 
+    key: PRNGKeyArray, 
+    rank: int 
+) -> tuple[XArray, XCovariance]:
     # Probabilistic PCA
 
     samples, features = x.shape
@@ -242,6 +250,10 @@ def get_data(key: PRNGKeyArray, n: int) -> Float[Array, "n d"]:
     return jnp.asarray(X)
 
 
-def measurement(key: PRNGKeyArray, x: Float[Array, "d"], cov_y: Float[Array, "d d"]) -> Float[Array, "d"]: 
+def measurement(
+    key: PRNGKeyArray, 
+    x: Float[Array, "d"], 
+    cov_y: Float[Array, "d d"]
+) -> Float[Array, "d"]: 
     # Sample from G[y|x, cov_y]
     return jr.multivariate_normal(key, x, cov_y) 

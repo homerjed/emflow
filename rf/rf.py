@@ -1,4 +1,5 @@
 from typing import Callable, Literal, Optional, Union
+
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -7,7 +8,7 @@ import diffrax as dfx
 from jaxtyping import PRNGKeyArray, Array, Float, Scalar, jaxtyped
 from beartype import beartype as typechecker
 
-from ..utils import exists, maybe_clip
+from utils import exists, maybe_clip
 
 typecheck = jaxtyped(typechecker=typechecker)
 
