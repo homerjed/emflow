@@ -9,16 +9,9 @@ import optax
 from jaxtyping import PRNGKeyArray, Array, Float, Scalar, PyTree, jaxtyped
 from beartype import beartype as typechecker
 
-from rf import RectifiedFlow
+from custom_types import XArray, YArray, YCovariance, typecheck
+from rf import RectifiedFlow, cosine_time, identity
 from utils import exists
-
-typecheck = jaxtyped(typechecker=typechecker)
-
-YArray = Float[Array, "2"]
-
-YCovariance = Float[Array, "2 2"]
-
-XArray = Float[Array, "2"]
 
 
 """
@@ -39,14 +32,6 @@ def apply_ema(
     e_, _e = eqx.partition(ema_model, eqx.is_inexact_array) # Old EMA params
     e_ = jax.tree_util.tree_map(ema_fn, e_, m_) # New EMA params
     return eqx.combine(e_, _m)
-
-
-def identity(t: Scalar) -> Scalar:
-    return t
-
-
-def cosine_time(t: Scalar) -> Scalar:
-    return 1. - (1. / (jnp.tan(0.5 * jnp.pi * t) + 1.)) # t1?
 
 
 def time_sampler(

@@ -10,14 +10,12 @@ import diffrax as dfx
 from custom_types import (
     XArray, XCovariance, YArray, YCovariance, TCovariance, 
     XSampleFn, XYSampleFn, SampleType, SDEType, PRNGKeyArray,
-    Scalar, get_typechecker
+    Scalar, typecheck
 )
 from rf import RectifiedFlow, velocity_to_score, score_to_velocity, get_flow_soln_kwargs
 from utils import exists, maybe_invert
 from posterior import get_score_gaussian_y_x, get_score_gaussian_x_y
 
-
-typecheck = get_typechecker()
 
 """
     DDIM
@@ -63,7 +61,7 @@ def single_x_y_ddim_sample_fn(
             assert (mu_x is not None) and (inv_cov_x is not None)
 
             # Implement CG method for this
-            score_y_x, score_x = get_score_gaussian_x_y(
+            score_x_y = get_score_gaussian_x_y(
                 y_, x_t, t, flow, cov_y=cov_y, mu_x=mu_x, inv_cov_x=inv_cov_x
             )
         else:
@@ -75,8 +73,6 @@ def single_x_y_ddim_sample_fn(
                 score_y_x, score_x = get_score_y_x_cg(
                     y_, x_t, t, flow, cov_x, cov_y, return_score_x=True
                 ) 
-
-        score_x_y = score_y_x + score_x
 
         drift, diffusion = flow.sde(z, t, sde_type=sde_type) # NOTE: implement SDE here?! DDIM for arbitrary SDE => use zero ends here 
 
@@ -178,20 +174,18 @@ def single_x_y_sample_fn_ode(
 
         if q_0_sampling:
             # Implement CG method for this
-            score_y_x, score_x = get_score_gaussian_x_y(
+            score_x_y = get_score_gaussian_x_y(
                 y_, x, t, flow, cov_y=cov_y, mu_x=mu_x, inv_cov_x=inv_cov_x
             )
         else:
             if mode == "full":
-                score_y_x, score_x = get_score_y_x(
+                score_x_y = get_score_x_y(
                     y_, x, t, flow, cov_y, return_score_x=True # x is x_t
                 ) 
             if mode == "cg":
                 score_y_x, score_x = get_score_y_x_cg(
                     y_, x, t, flow, cov_x, cov_y, return_score_x=True
                 ) 
-
-        score_x_y = score_x + score_y_x
 
         return flow.reverse_ode(x, t, score=score_x_y, sde_type=sde_type) 
 
@@ -352,6 +346,10 @@ def single_non_singular_x_y_sample_fn(
     Sampler utils
 """
 
+"""
+    > Posterior samplers
+"""
+
 
 @typecheck
 def get_x_y_sampler_ddim(
@@ -449,37 +447,6 @@ def get_x_y_sampler_sde(
 
 
 @typecheck
-def get_ode_sample_fn(
-    flow: RectifiedFlow,
-    *,
-    alpha: float = 0.1,
-    sde_type: SDEType = "zero-ends"
-) -> XSampleFn:
-    # Sampler for e.g. sampling latents from model p(x) without y 
-    fn = lambda key: single_sample_fn_ode(
-        flow, key=key, alpha=alpha, sde_type=sde_type
-    )
-    return fn
-
-
-@typecheck
-def get_non_singular_sample_fn(
-    flow: RectifiedFlow,
-    *,
-    n_steps: int = 500,
-    g_scale: float = 0.1,
-    n: float = 1.,
-    m: float = 0.,
-    sde_type: SDEType = "zero-ends" # Ignored, for compatibility
-) -> XSampleFn:
-    # Sampler for e.g. sampling latents from model p(x) without y 
-    fn = lambda key: single_non_singular_sample_fn(
-        flow, key=key, g_scale=g_scale, n_steps=n_steps, n=n, m=m
-    )
-    return fn
-
-
-@typecheck
 def get_x_y_sampler(
     flow: RectifiedFlow, 
     sampling_mode: SampleType, 
@@ -512,6 +479,42 @@ def get_x_y_sampler(
     )
 
     return sampler
+
+
+"""
+    > Latent samplers
+"""
+
+
+@typecheck
+def get_ode_sample_fn(
+    flow: RectifiedFlow,
+    *,
+    alpha: float = 0.1,
+    sde_type: SDEType = "zero-ends"
+) -> XSampleFn:
+    # Sampler for e.g. sampling latents from model p(x) without y 
+    fn = lambda key: single_sample_fn_ode(
+        flow, key=key, alpha=alpha, sde_type=sde_type
+    )
+    return fn
+
+
+@typecheck
+def get_non_singular_sample_fn(
+    flow: RectifiedFlow,
+    *,
+    n_steps: int = 500,
+    g_scale: float = 0.1,
+    n: float = 1.,
+    m: float = 0.,
+    sde_type: SDEType = "zero-ends" # Ignored, for compatibility
+) -> XSampleFn:
+    # Sampler for e.g. sampling latents from model p(x) without y 
+    fn = lambda key: single_non_singular_sample_fn(
+        flow, key=key, g_scale=g_scale, n_steps=n_steps, n=n, m=m
+    )
+    return fn
 
 
 @typecheck

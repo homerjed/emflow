@@ -3,9 +3,7 @@ from jaxtyping import PRNGKeyArray, Float, Array, Scalar, jaxtyped
 from beartype import beartype as typechecker
 
 
-def get_typechecker():
-    return jaxtyped(typechecker=typechecker)
-
+typecheck = jaxtyped(typechecker=typechecker)
 
 YArray = Float[Array, "2"]
 
@@ -24,3 +22,5 @@ XYSampleFn = Callable[[PRNGKeyArray, XArray], XArray]
 SDEType = Literal["non-singular", "zero-ends", "singular", "gamma"]
 
 SampleType = Literal["ddim", "sde", "ode"]
+
+Datasets = Literal["gmm", "moons", "blob", "double-blob"]

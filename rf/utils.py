@@ -1,6 +1,7 @@
 import os
-from typing import Optional, Union
+from typing import Optional, Union, Literal
 from shutil import rmtree
+
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -12,15 +13,11 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from sklearn.datasets import make_moons
 from sklearn.preprocessing import StandardScaler
-# import tensorflow_probability.substrates.jax.distributions as tfd
+import tensorflow_probability.substrates.jax.distributions as tfd
 
-XArray = Float[Array, "2"]
+from custom_types import XArray, XCovariance, Datasets, typecheck
 
-XCovariance = Float[Array, "2 2"]
-
-typecheck = jaxtyped(typechecker=typechecker)
-
-EPS = 1e-10 
+EPS = None
 
 
 def exists(v):
@@ -160,7 +157,11 @@ def create_gif(image_folder):
         [
             os.path.join(image_folder, img) 
             for img in os.listdir(image_folder) 
-            if img.endswith(("png")) and "L" not in img
+            if (
+                img.startswith(("samples")) 
+                and img.endswith(("png")) 
+                and "L" not in img
+            )
         ]
     )
     frames = [Image.open(img) for img in images]
@@ -221,31 +222,57 @@ def clip_latents(X, x_clip_limit):
 """
 
 
-def get_data(key: PRNGKeyArray, n: int) -> Float[Array, "n d"]:
-    seed = int(jnp.sum(jr.key_data(key)))
-    X, _ = make_moons(n, noise=0.04, random_state=seed)
+def get_data(
+    key: PRNGKeyArray, 
+    n: int, 
+    dataset: Datasets
+) -> Float[Array, "n d"]:
 
-    # N = 8 # Mixture components
-    # alphas = jnp.linspace(0, 2. * jnp.pi * (1. - 1. / N), N)
-    # xs = jnp.cos(alphas)
-    # ys = jnp.sin(alphas)
-    # means = jnp.stack([xs, ys], axis=1)
+    if dataset == "blob":
+        X = jr.multivariate_normal(
+            key, mean=jnp.ones((2,)), cov=jnp.identity(2) * 0.1, shape=(n,)
+        )
 
-    # gaussian_mixture = tfd.Mixture(
-    #     cat=tfd.Categorical(
-    #         probs=jnp.ones((means.shape[0])) / means.shape[0]
-    #     ),
-    #     components=[
-    #         tfd.MultivariateNormalDiag(
-    #             loc=mu, scale_diag=jnp.ones_like(mu) * 0.1
-    #         )
-    #         for mu in means
-    #     ]
-    # )
-    # X = gaussian_mixture.sample((n,), seed=key)
+    if dataset == "double-blob":
+        key_0, key_1 = jr.split(key)
 
-    s = StandardScaler() # Need to keep doing this for each EM's x|y?
-    X = s.fit_transform(X)
+        X_0 = jr.multivariate_normal(
+            key_0, mean=jnp.ones((2,)) * 0.5, cov=jnp.identity(2) * 0.1, shape=(n // 2,)
+        )
+
+        X_1 = jr.multivariate_normal(
+            key_1, mean=jnp.ones((2,)) * -0.5, cov=jnp.identity(2) * 0.1, shape=(n // 2,)
+        )
+
+        X = jnp.concatenate([X_0, X_1])
+
+    if dataset == "moons":
+        seed = int(jnp.sum(jr.key_data(key)))
+        X, _ = make_moons(n, noise=0.04, random_state=seed)
+
+    if dataset == "gmm":
+        N = 8 # Mixture components
+        alphas = jnp.linspace(0, 2. * jnp.pi * (1. - 1. / N), N)
+        xs = jnp.cos(alphas)
+        ys = jnp.sin(alphas)
+        means = jnp.stack([xs, ys], axis=1)
+
+        gaussian_mixture = tfd.Mixture(
+            cat=tfd.Categorical(
+                probs=jnp.ones((means.shape[0])) / means.shape[0]
+            ),
+            components=[
+                tfd.MultivariateNormalDiag(
+                    loc=mu, scale_diag=jnp.ones_like(mu) * 0.1
+                )
+                for mu in means
+            ]
+        )
+        X = gaussian_mixture.sample((n,), seed=key)
+
+    # if dataset != "blob":
+    #     s = StandardScaler() # Need to keep doing this for each EM's x|y?
+    #     X = s.fit_transform(X)
 
     return jnp.asarray(X)
 

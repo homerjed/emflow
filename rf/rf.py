@@ -5,16 +5,18 @@ import jax.numpy as jnp
 import jax.random as jr
 import equinox as eqx
 import diffrax as dfx
-from jaxtyping import PRNGKeyArray, Array, Float, Scalar, jaxtyped
-from beartype import beartype as typechecker
+from jaxtyping import PRNGKeyArray, Array, Float, Scalar
 
+from custom_types import XArray, SDEType, typecheck
 from utils import exists, maybe_clip
 
-typecheck = jaxtyped(typechecker=typechecker)
 
-XArray = Float[Array, "2"]
+def identity(t: Scalar) -> Scalar:
+    return t
 
-SDEType = Literal["non-singular", "zero-ends", "singular", "gamma"]
+
+def cosine_time(t: Scalar) -> Scalar:
+    return 1. - (1. / (jnp.tan(0.5 * jnp.pi * t) + 1.)) # t1?
 
 
 class Linear(eqx.Module):
@@ -296,3 +298,29 @@ def get_flow_soln_kwargs(flow: RectifiedFlow, reverse: bool = False) -> dict:
         soln_kwargs["t1"], soln_kwargs["t0"] = soln_kwargs["t0"], soln_kwargs["t1"]
         soln_kwargs["dt0"] = -soln_kwargs["dt0"]
     return soln_kwargs
+
+
+def get_rectified_flow(
+    data_dim: int, 
+    width_size: int, 
+    depth: int, 
+    time_embedding_dim: int, 
+    soln_kwargs: dict, 
+    key: PRNGKeyArray
+) -> RectifiedFlow:
+
+    time_embedder = get_timestep_embedding(time_embedding_dim)
+
+    net = ResidualNetwork(
+        data_dim, 
+        width_size=width_size, 
+        depth=depth, 
+        t_embedding_dim=time_embedding_dim, 
+        t1=soln_kwargs["t1"],
+        key=key
+    )
+
+    flow = RectifiedFlow(
+        net, time_embedder, x_shape=(data_dim,), **soln_kwargs
+    )
+    return flow
