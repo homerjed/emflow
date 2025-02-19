@@ -171,10 +171,10 @@ if __name__ == "__main__":
     time_embedding_dim   = 64
 
     # Data
-    dataset              = "blob"
+    dataset              = "moons"
     data_dim             = 2
     n_data               = 100_000
-    sigma_y              = 0.1 
+    sigma_y              = 0.05
     cov_y                = jnp.eye(data_dim) * jnp.square(sigma_y)
 
     assert dataset in ["gmm", "moons", "blob", "double-blob"]
