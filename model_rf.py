@@ -196,7 +196,7 @@ class RectifiedFlow(eqx.Module):
     def p_t(self, x_0: XArray, t: Scalar, eps: XArray) -> XArray:
         return self.alpha(t) * x_0 + self.sigma(t) * eps # NOTE: add eps to sigma(t) here so x_t=0 = x_0 + deps
 
-    @typecheck
+    # @typecheck
     def sde(
         self, 
         x: XArray, 
@@ -208,6 +208,8 @@ class RectifiedFlow(eqx.Module):
     ) -> Union[
         tuple[XArray, Scalar], tuple[XArray, Scalar, XArray]
     ]:
+        assert sde_type in ["non-singular", "zero-ends", "singular", "gamma"], "sde_type={}".format(sde_type)
+
         v = self.v(t, x)
         score = velocity_to_score(flow=None, t=t, x=x, velocity=v)
 
@@ -232,7 +234,7 @@ class RectifiedFlow(eqx.Module):
         else:
             return drift, diffusion
 
-    @typecheck
+    # @typecheck
     def reverse_ode(
         self, 
         x: XArray, 

@@ -182,7 +182,7 @@ def get_score_gaussian_y_x(
     score_x = (x + cov_t @ inv_cov_x @ (x - mu_x)) / maybe_clip(alpha_t)  # Tweedie with score of analytic G[x|mu_x, cov_x]
 
     E_x_x_t, J_E_x_x_t = value_and_jacfwd(
-        get_E_x_x_t_gaussian, x, alpha=alpha_t, cov=cov_t, score=score_x
+        get_E_x_x_t_gaussian, x, alpha_t=alpha_t, cov_t=cov_t, score_t=score_x
     ) 
 
     V_x_x_t = cov_t @ J_E_x_x_t / maybe_clip(alpha_t) # Approximation to Eq 21, see Eq 22. (or heuristics; cov_t, inv(cov_t)...)
@@ -210,7 +210,9 @@ def get_score_gaussian_x_y(
 
     score_x = (x + cov_t @ inv_cov_x @ (x - mu_x)) / maybe_clip(alpha_t) # Tweedie with score of analytic G[x|mu_x, cov_x]
 
-    score_y_x = get_score_gaussian_y_x(y_, x, t, flow, cov_y, mu_x, inv_cov_x)
+    score_y_x = get_score_gaussian_y_x(
+        y_, x, t, flow, cov_y, mu_x, inv_cov_x
+    )
 
     score_x_y = score_y_x + score_x
 
@@ -313,24 +315,33 @@ def single_sample_fn_ode(
     flow: RectifiedFlow, 
     key: PRNGKeyArray, 
     *,
-    alpha: float = 0.1
+    alpha: float = 0.1,
+    sde_type: SDEType = "zero-ends"
 ) -> XArray:
     """ Sample ODE of non-singular SDE corresponding to Gaussian flow matching marginals """
 
-    def _ode(t, x, args):
+    def ode(t: Scalar, x: XArray, args: Optional[tuple]) -> XArray:
         # Non-Singular ODE; using score of Gaussian Rectified Flow
         t = jnp.asarray(t)
         v = flow.v(t, x)
+
         # score = -((1. - t) * v + x) / t # Assuming mu_1, sigma_1 = 0, 1 #NOTE: bug! -x not +x
+        # score = velocity_to_score(flow=None, t=t, x=x, velocity=v)
+        # drift = v + 0.5 * jnp.square(alpha) * t * score # Non-singular SDE
+        # return drift
+
         score = velocity_to_score(flow=None, t=t, x=x, velocity=v)
-        drift = v + 0.5 * jnp.square(alpha) * t * score # Non-singular SDE
-        return drift
+        # drift, diffusion = flow.sde(
+        #     x, t, alpha=alpha, sde_type=sde_type
+        # ) 
+        # return drift - 0.5 * jnp.square(diffusion) * score # Posterior score
+        return flow.reverse_ode(x, t, score, alpha=alpha, sde_type=sde_type)
     
     flow = eqx.nn.inference_mode(flow, True)
 
     z = jr.normal(key, flow.x_shape)
 
-    term = dfx.ODETerm(_ode) 
+    term = dfx.ODETerm(ode) 
 
     sol = dfx.diffeqsolve(
         term, 
@@ -361,7 +372,7 @@ def single_x_y_sample_fn_ode(
 ) -> XArray:
     # Latent posterior sampling function
 
-    def reverse_ode(t, x, args):
+    def reverse_ode(t: Scalar, x: XArray, args: Optional[tuple]) -> XArray:
         # Sampling along conditional score p(x|y)
         t = jnp.asarray(t)
 
@@ -501,8 +512,6 @@ def single_non_singular_x_y_sample_fn(
                 y_, z, 1. - _t, flow, cov_y=cov_y, mu_x=mu_x, inv_cov_x=inv_cov_x
             )
         else:
-            # score_p_y_x_t = get_score_y_x(y_, z, _t, flow, cov_y)
-            
             if mode == "full":
                 score_p_y_x_t = get_score_y_x(
                     y_, z, 1. - _t, flow, cov_y # x is x_t
@@ -513,9 +522,9 @@ def single_non_singular_x_y_sample_fn(
                 ) 
 
         # Adding velocity[score(p(y|x))]
-        z_hat = flow.v(1. - _t, z) + score_to_velocity(score_p_y_x_t, 1. - _t, z) # Add velocity(score_y_x) here
+        # z_hat = flow.v(1. - _t, z) + score_to_velocity(score_p_y_x_t, 1. - _t, z) # Add velocity(score_y_x) here
         # Adding velocity[p(y|x)]
-        # z_hat = flow.v(1. - _t, z) + jnp.square(flow.sigma(1. - _t)) * (1. / (_t * (1. - _t))) * score_p_y_x_t # Add velocity(score_y_x) here
+        z_hat = flow.v(1. - _t, z) + jnp.square(flow.sigma(1. - _t)) * (1. / (_t * (1. - _t))) * score_p_y_x_t # Add velocity(score_y_x) here
 
         _z_hat = -z_hat
         g = g_scale * jnp.power(_t, 0.5 * n) * jnp.power(1. - _t, 0.5 * m)
@@ -642,11 +651,12 @@ def get_x_y_sampler_sde(
 def get_ode_sample_fn(
     flow: RectifiedFlow,
     *,
-    alpha: float = 0.1
+    alpha: float = 0.1,
+    sde_type: SDEType = "zero-ends"
 ) -> XSampleFn:
     # Sampler for e.g. sampling latents from model p(x) without y 
     fn = lambda key: single_sample_fn_ode(
-        flow, key=key, alpha=alpha
+        flow, key=key, alpha=alpha, sde_type=sde_type
     )
     return fn
 
@@ -667,13 +677,17 @@ def get_non_singular_sample_fn(
     return fn
 
 
-def test_train(key, flow, X, n_batch, diffusion_iterations, save_dir):
+def test_train(key, flow, X, n_batch, diffusion_iterations, use_ema, save_dir):
+    # Test whether training config fits FM model on latents
 
     opt, opt_state = get_opt_and_state(flow, soap, lr=1e-3)
 
+    if use_ema:
+        ema_flow = deepcopy(flow)
+
     losses_i = []
     with trange(
-        diffusion_iterations, desc="Training", colour="green"
+        diffusion_iterations, desc="Training (test)", colour="red"
     ) as steps:
         for i in steps:
             key_x, key_step = jr.split(jr.fold_in(key, i))
@@ -690,8 +704,8 @@ def test_train(key, flow, X, n_batch, diffusion_iterations, save_dir):
                 time_schedule=identity
             )
 
-            # if use_ema:
-            #     ema_flow = apply_ema(ema_flow, flow, ema_rate)
+            if use_ema:
+                ema_flow = apply_ema(ema_flow, flow, ema_rate)
 
             losses_i.append(L)
             steps.set_postfix_str(f"{L=:.3E}")
@@ -701,7 +715,7 @@ def test_train(key, flow, X, n_batch, diffusion_iterations, save_dir):
     # Generate latents from q(x)
     keys = jr.split(key_sample, 8000)
     X_test_sde = jax.vmap(get_non_singular_sample_fn(flow))(keys)
-    X_test_ode = jax.vmap(partial(single_sample_fn_ode, flow))(keys)
+    X_test_ode = jax.vmap(partial(single_sample_fn_ode, flow, sde_type=sde_type))(keys)
 
     plt.figure()
     plt.scatter(*X.T, s=0.1, color="k")
@@ -717,7 +731,7 @@ if __name__ == "__main__":
     save_dir             = clear_and_get_results_dir(save_dir="imgs__/")
 
     # Train
-    test_on_latents      = False
+    test_on_latents      = True
     em_iterations        = 64
     diffusion_iterations = 5_000
     n_batch              = 5_000
@@ -729,28 +743,28 @@ if __name__ == "__main__":
     initial_lr           = 1e-6
     n_epochs_warmup      = 1
     ppca_pretrain        = False
-    n_pca_iterations     = 10
+    n_pca_iterations     = 256
     clip_x_y             = False #True # Clip sampled latents
     x_clip_limit         = 4.
     re_init_opt_state    = True
     n_plot               = 10_000
     sampling_mode        = "ode"        # ODE, SDE or DDIM
-    sde_type             = "non-singular"  # SDE of flow ODE
+    sde_type             = "zero-ends"  # SDE of flow ODE
     mode                 = "full"       # CG mode or not
-    use_ema              = False
-    ema_rate             = 0.999
+    use_ema              = True
+    ema_rate             = 0.9999
 
     # Model
     width_size           = 256 
-    depth                = 2 
+    depth                = 3 
     activation           = jax.nn.gelu 
     soln_kwargs          = dict(t0=0., dt0=0.02, t1=1., solver=dfx.Euler()) # For ODE NOTE: this eps supposed to be bad idea
-    time_embedding_dim   = 32
+    time_embedding_dim   = 64
 
     # Data
     data_dim             = 2
     n_data               = 100_000
-    sigma_y              = 0.2 # Tiny eigenvalues may have been numerically unstable?
+    sigma_y              = 0.05 # Tiny eigenvalues may have been numerically unstable?
     cov_y                = jnp.eye(data_dim) * jnp.square(sigma_y)
 
     assert sampling_mode in ["ddim", "ode", "sde"]
@@ -806,6 +820,7 @@ if __name__ == "__main__":
             X, 
             n_batch=n_batch,
             diffusion_iterations=diffusion_iterations, 
+            use_ema=use_ema,
             save_dir=save_dir
         )
 
@@ -845,7 +860,7 @@ if __name__ == "__main__":
     if sampling_mode in ["ddim", "sde"]:
         X_test = jax.vmap(get_non_singular_sample_fn(flow))(keys)
     if sampling_mode == "ode":
-        X_test = jax.vmap(get_ode_sample_fn(flow))(keys)
+        X_test = jax.vmap(get_ode_sample_fn(flow, sde_type=sde_type))(keys)
 
     # Plot initial samples
     plot_samples(X, X_, Y, X_test, save_dir=save_dir)
@@ -879,7 +894,7 @@ if __name__ == "__main__":
                     ema_flow = apply_ema(ema_flow, flow, ema_rate)
 
                 losses_i.append(L)
-                steps.set_postfix_str(f"\r {k=:04d} {L=:.3E}")
+                steps.set_postfix_str(f"{k=:04d} {L=:.3E}")
 
         # Plot losses
         losses_k += losses_i
@@ -908,7 +923,7 @@ if __name__ == "__main__":
         if sampling_mode in ["ddim", "sde"]:
             X_test = jax.vmap(get_non_singular_sample_fn(ema_flow if use_ema else flow))(keys)
         if sampling_mode == "ode":
-            X_test = jax.vmap(get_ode_sample_fn(ema_flow if use_ema else flow))(keys)
+            X_test = jax.vmap(get_ode_sample_fn(ema_flow if use_ema else flow, sde_type=sde_type))(keys)
 
         # Plot latents
         plot_samples(X, X_, Y, X_test, iteration=k + 1, save_dir=save_dir)
