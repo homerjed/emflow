@@ -35,7 +35,7 @@ if __name__ == "__main__":
 
     config = get_double_blob_config() 
 
-    save_dir = clear_and_get_results_dir(save_dir="imgs_{}/".format(config.data.dataset))
+    save_dir = clear_and_get_results_dir(save_dir="out/imgs_{}/".format(config.data.dataset))
 
     save_config(config, filename=os.path.join(save_dir, "config.yml"))
 
