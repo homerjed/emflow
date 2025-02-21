@@ -124,8 +124,6 @@ if __name__ == "__main__":
             ):
                 key_x, key_step = jr.split(jr.fold_in(key_k, s))
 
-                # xy = jr.choice(key_x, X_Y, (config.train.n_batch,)) # Make sure always choosing x ~ p(x|y)
-
                 L, flow, key, opt_state = make_step(
                     flow, 
                     xy, 
