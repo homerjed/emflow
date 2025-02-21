@@ -18,7 +18,7 @@ To implement:
     <img src="assets/training.gif" width="50%">
 </div>
 
-#### Citations
+## Citations
 
 ```bibtex
 @misc{rozet2024learningdiffusionpriorsobservations,
