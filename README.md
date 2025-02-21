@@ -12,11 +12,13 @@ To implement:
 - [ ] Mixed precision
 - [x] EMA
 - [ ] Hyperparameter/model saving
-- [ ] CG data-likelihood calculation ($q_0(x|y)$ as well as $q(x|y)$)
+- [ ] CG data-likelihood calculation 
 
 <div align="center">
     <img src="assets/training.gif" width="50%">
 </div>
+
+#### Citations
 
 ```bibtex
 @misc{rozet2024learningdiffusionpriorsobservations,
