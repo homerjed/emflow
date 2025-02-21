@@ -8,7 +8,7 @@ from tqdm import trange
 
 from custom_types import (
     XArray, XCovariance, SDEType, 
-    SampleType, Datasets, PRNGKeyArray, 
+    SampleType, PRNGKeyArray, 
     Float, Array, typecheck
 )
 from rf import RectifiedFlow
@@ -23,7 +23,7 @@ def gaussian_log_prob(x, mu_x, cov_x):
 @typecheck
 @eqx.filter_jit
 def ppca(
-    x: Float[Array, "n 2"], 
+    x: Float[Array, "n d"], 
     key: PRNGKeyArray, 
     rank: int 
 ) -> tuple[XArray, XCovariance]:
@@ -61,6 +61,7 @@ def ppca(
     # cov_x = DPLR(D * jnp.ones(features), U, U.T)
 
     return mu_x, C #jnp.eye(features) * D #C # cov_x
+
 
 def run_ppca(
     key: PRNGKeyArray, 

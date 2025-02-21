@@ -53,7 +53,7 @@ def get_timestep_embedding(embedding_dim: int) -> Callable[[Scalar], Float[Array
 
 class RectifiedFlow(eqx.Module):
     net: eqx.Module
-    time_embedder: Callable
+    time_embedder: Optional[Callable]
     x_shape: tuple[int]
     x_dim: int
     t0: float
@@ -64,8 +64,8 @@ class RectifiedFlow(eqx.Module):
     @typecheck
     def __init__(
         self, 
-        net: eqx.Module, 
-        time_embedder: Callable,
+        net: ResidualNetwork | DiT | eqx.Module, 
+        time_embedder: Optional[Callable],
         *,
         x_shape: tuple[int],
         t0: float,
@@ -104,7 +104,7 @@ class RectifiedFlow(eqx.Module):
     def p_t(self, x_0: XArray, t: Scalar, eps: XArray) -> XArray:
         return self.alpha(t) * x_0 + self.sigma(t) * eps # NOTE: add eps to sigma(t) here so x_t=0 = x_0 + deps
 
-    # @typecheck
+    @typecheck
     def sde(
         self, 
         x: XArray, 
@@ -121,7 +121,7 @@ class RectifiedFlow(eqx.Module):
         v = self.v(t, x)
         score = velocity_to_score(flow=None, t=t, x=x, velocity=v)
 
-        # Non-singular SDE[v(x, t)]
+        # Non-singular SDE[v(x, t)]; NOTE: at ends of time, f and g are zero, so score is multipled by zero?
         if sde_type == "non-singular":
             f_, g_ = t, t
         # Zero-ends SDE[v(x, t)]
@@ -142,7 +142,7 @@ class RectifiedFlow(eqx.Module):
         else:
             return drift, diffusion
 
-    # @typecheck
+    @typecheck
     def reverse_ode(
         self, 
         x: XArray, 
@@ -159,7 +159,8 @@ class RectifiedFlow(eqx.Module):
 
     @typecheck
     def v(self, t: Scalar, x: XArray) -> XArray:
-        t = self.time_embedder(t)
+        if exists(self.time_embedder):
+            t = self.time_embedder(t)
         return self.net(t, x)
 
     @typecheck
@@ -203,27 +204,45 @@ def get_flow_soln_kwargs(flow: RectifiedFlow, reverse: bool = False) -> dict:
     return soln_kwargs
 
 
-def get_rectified_flow(
-    data_dim: int, 
-    width_size: int, 
-    depth: int, 
-    time_embedding_dim: int, 
-    soln_kwargs: dict, 
-    key: PRNGKeyArray
-) -> RectifiedFlow:
+def get_rectified_flow(model_config: dict, key: PRNGKeyArray) -> RectifiedFlow:
 
-    time_embedder = get_timestep_embedding(time_embedding_dim)
+    assert model_config.model_type in ["resnet", "dit"]
 
-    net = ResidualNetwork(
-        data_dim, 
-        width_size=width_size, 
-        depth=depth, 
-        t_embedding_dim=time_embedding_dim, 
-        t1=soln_kwargs["t1"],
-        key=key
-    )
+    if model_config.model_type == "resnet":
+        time_embedder = get_timestep_embedding(
+            model_config.time_embedding_dim
+        )
+
+        net = ResidualNetwork(
+            model_config.data_dim, 
+            width_size=model_config.width_size, 
+            depth=model_config.depth, 
+            t_embedding_dim=model_config.time_embedding_dim, 
+            t1=model_config.soln_kwargs["t1"],
+            key=key
+        )
+
+        x_shape = (model_config.data_dim,)
+
+    if model_config.model_type == "dit":
+        time_embedder = None
+
+        net = DiT(
+            model_config.img_size,
+            patch_size=model_config.patch_size,
+            channels=model_config.channels,
+            embed_dim=model_config.embed_dim,
+            depth=model_config.depth,
+            n_heads=model_config.n_heads,
+            key=key
+        )
+
+        x_shape = (model_config.img_size ** 2,)
 
     flow = RectifiedFlow(
-        net, time_embedder, x_shape=(data_dim,), **soln_kwargs
+        net, 
+        time_embedder, # Not needed for DiT
+        x_shape=x_shape,
+        **model_config.soln_kwargs
     )
     return flow

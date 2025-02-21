@@ -6,44 +6,34 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import equinox as eqx
-import diffrax as dfx
 from tqdm.auto import trange
-import matplotlib.pyplot as plt
 
-from custom_types import (
-    XArray, XCovariance, PRNGKeyArray, 
-    Float, Array, SDEType, 
-    SampleType
+from configs import (
+    get_blob_config, get_double_blob_config, 
+    get_gmm_config, get_mnist_config, 
+    save_config
 )
-from configs import get_blob_config, get_gmm_config, save_config
-from rf import (
-    RectifiedFlow, ResidualNetwork, 
-    get_timestep_embedding, get_flow_soln_kwargs, 
-    velocity_to_score, score_to_velocity,
-    get_rectified_flow,
-    cosine_time,
-    identity
-)
+from rf import get_rectified_flow
 from train import make_step, apply_ema, test_train
 from sample import (
-    get_x_sampler, get_x_y_sampler, get_non_singular_sample_fn, single_sample_fn_ode 
+    get_x_sampler, get_x_y_sampler
 )
 from utils import (
     get_opt_and_state, clear_and_get_results_dir, 
     create_gif, plot_losses, plot_samples, 
     clip_latents, get_data, measurement,
-    exists, default, maybe_clip, maybe_invert,
-    plot_losses_ppca
+    get_loader
 )
 from ppca import run_ppca
-from soap import soap
 
 
 if __name__ == "__main__":
+
     key = jr.key(int(time.time()))
 
-    config = get_blob_config()
+    key_net, key_data, key_measurement, key_ppca, key_em = jr.split(key, 5)
+
+    config = get_double_blob_config() 
 
     save_dir = clear_and_get_results_dir(save_dir="imgs_{}/".format(config.data.dataset))
 
@@ -51,17 +41,8 @@ if __name__ == "__main__":
 
     print("Running on {} dataset.".format(config.data.dataset))
 
-    key_net, key_data, key_measurement, key_ppca, key_em = jr.split(key, 5)
-
     # Rectified flow model and EMA
-    flow = get_rectified_flow(
-        config.data.data_dim, 
-        config.model.width_size, 
-        config.model.depth, 
-        config.model.time_embedding_dim, 
-        config.model.soln_kwargs, 
-        key=key_net
-    )
+    flow = get_rectified_flow(config.model, key=key_net)
 
     if config.train.use_ema:
         ema_flow = deepcopy(flow)
@@ -87,6 +68,7 @@ if __name__ == "__main__":
     keys = jr.split(key_measurement, config.data.n_data)
     Y = jax.vmap(partial(measurement, cov_y=cov_y))(keys, X) 
 
+    # Test if config can fit to p(x)
     if config.train.test_on_latents:
         test_train(
             key, 
@@ -94,7 +76,9 @@ if __name__ == "__main__":
             X, 
             n_batch=config.train.n_batch,
             diffusion_iterations=config.train.diffusion_iterations, 
+            lr=config.train.lr,
             use_ema=config.train.use_ema,
+            ema_rate=config.train.ema_rate,
             sde_type=config.train.sde_type,
             save_dir=save_dir
         )
@@ -135,10 +119,12 @@ if __name__ == "__main__":
         with trange(
             config.train.diffusion_iterations, desc="Training", colour="green"
         ) as steps:
-            for s in steps:
+            for s, xy in zip(
+                steps, get_loader(X_Y, key=key_k).loop(config.train.n_batch)
+            ):
                 key_x, key_step = jr.split(jr.fold_in(key_k, s))
 
-                xy = jr.choice(key_x, X_Y, (config.train.n_batch,)) # Make sure always choosing x ~ p(x|y)
+                # xy = jr.choice(key_x, X_Y, (config.train.n_batch,)) # Make sure always choosing x ~ p(x|y)
 
                 L, flow, key, opt_state = make_step(
                     flow, 

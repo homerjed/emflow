@@ -1,4 +1,6 @@
+import os
 from functools import partial
+from copy import deepcopy
 from typing import Callable, Literal, Optional
 
 import jax
@@ -6,12 +8,15 @@ import jax.numpy as jnp
 import jax.random as jr
 import equinox as eqx
 import optax
-from jaxtyping import PRNGKeyArray, Array, Float, Scalar, PyTree, jaxtyped
-from beartype import beartype as typechecker
+from jaxtyping import PRNGKeyArray, Array, Float, Scalar, PyTree
+import matplotlib.pyplot as plt
+from tqdm import trange
 
-from custom_types import XArray, YArray, YCovariance, typecheck
+from custom_types import XArray, SDEType, typecheck
 from rf import RectifiedFlow, cosine_time, identity
-from utils import exists
+from sample import get_non_singular_sample_fn, single_sample_fn_ode
+from utils import exists, get_opt_and_state
+from soap import soap
 
 
 """
@@ -41,7 +46,7 @@ def time_sampler(
     t1: float, 
     time_schedule: Optional[Callable[[Scalar], Scalar]] = None
 ) -> Scalar:
-    t = jr.uniform(key, (n,), minval=t0, maxval=t1 / n)
+    t = jr.uniform(key, (n,), minval=t0, maxval=t1 / n) # t = jax.random.beta(keys[1], a=3, b=3, shape=(n,))
     t = t + (t1 / n) * jnp.arange(n)
     if exists(time_schedule):
         t = time_schedule(t)
@@ -55,7 +60,7 @@ def mse(x: XArray, y: XArray) -> XArray:
 @typecheck
 def batch_loss_fn(
     flow: RectifiedFlow, 
-    x_0: Float[Array, "n 2"], 
+    x_0: Float[Array, "n ..."], 
     key: PRNGKeyArray, 
     *,
     sigma_min: float = 1e-4,
@@ -76,20 +81,6 @@ def batch_loss_fn(
         time_schedule=time_schedule
     )
 
-    x_1 = jr.normal(key_eps, x_0.shape) 
-
-    # Flow matching
-
-    # def single_fm_loss(flow, t, x_0, x_1):
-    #     psi = (1. - t) * x_0 + (1. - (1. - sigma_min) * (1. - t)) * x_1
-    #     psi = t * x_0 + (1. - (1. - sigma_min) * t) * x_1
-    #     u = (1. - sigma_min) * x_1 - x_0
-    #     v = flow.v(t, psi)
-    #     return mse(u, v)
-
-    # loss = jnp.mean(jax.vmap(partial(single_fm_loss, flow))(t, x_0, x_1))
-    
-    # Rectified
     x_1 = jr.normal(key_eps, x_0.shape) 
 
     x_t = jax.vmap(flow.p_t)(x_0, t, x_1) 
@@ -202,13 +193,24 @@ def accumulate_gradients_scan(
     return metrics, grads
 
 
-def test_train(key, flow, X, n_batch, diffusion_iterations, use_ema, sde_type, save_dir):
+def test_train(
+    key: PRNGKeyArray, 
+    flow: RectifiedFlow, 
+    X: Float[Array, "n ..."], 
+    n_batch: int, 
+    diffusion_iterations: int, 
+    lr: float, 
+    use_ema: bool, 
+    ema_rate: float, 
+    sde_type: SDEType, 
+    save_dir: str
+) -> None:
     # Test whether training config fits FM model on latents
 
     # jax.config.update("jax_debug_nans", True)
     # jax.config.update('jax_disable_jit', True)
 
-    opt, opt_state = get_opt_and_state(flow, soap, lr=1e-3)
+    opt, opt_state = get_opt_and_state(flow, soap, lr=lr)
 
     if use_ema:
         ema_flow = deepcopy(flow)

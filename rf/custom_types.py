@@ -5,15 +5,15 @@ from beartype import beartype as typechecker
 
 typecheck = jaxtyped(typechecker=typechecker)
 
-YArray = Float[Array, "2"]
+YArray = Float[Array, "d"] | Float[Array, "_ _ _"]
 
-YCovariance = Float[Array, "2 2"]
+YCovariance = Float[Array, "d d"] 
 
-XArray = Float[Array, "2"]
+XArray = Float[Array, "d"] | Float[Array, "_ _ _"]
 
-XCovariance = Float[Array, "2 2"]
+XCovariance = Float[Array, "d d"]
 
-TCovariance = Float[Array, "2 2"]
+TCovariance = Float[Array, "d d"] 
 
 XSampleFn = Callable[[PRNGKeyArray], XArray]
 
@@ -23,4 +23,4 @@ SDEType = Literal["non-singular", "zero-ends", "singular", "gamma"]
 
 SampleType = Literal["ddim", "sde", "ode"]
 
-Datasets = Literal["gmm", "moons", "blob", "double-blob"]
+Datasets = Literal["gmm", "moons", "blob", "double-blob", "mnist"]

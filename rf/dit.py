@@ -1,8 +1,9 @@
-from typing import Optional
+from typing import Optional, Union, Callable
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 import equinox as eqx
+from einops import rearrange
 
 from custom_types import PRNGKeyArray, XArray, Array, Float, Scalar, typecheck
 
@@ -16,6 +17,14 @@ AArray = Float[Array, "..."]
 """
 
 
+def exists(v):
+    return v is not None
+
+
+def precision_cast(fn: Union[Callable, eqx.Module], x: Array) -> Array:
+    return fn(x.astype(jnp.float32)).astype(x.dtype)
+
+
 class AdaLayerNorm(eqx.Module):
     norm: eqx.nn.LayerNorm
     scale_proj: eqx.nn.Linear
@@ -24,8 +33,11 @@ class AdaLayerNorm(eqx.Module):
     @typecheck
     def __init__(self, embed_dim: int, *, key: PRNGKeyArray):
         keys = jr.split(key)
+
         self.norm = eqx.nn.LayerNorm(embed_dim)
+
         self.scale_proj = eqx.nn.Linear(embed_dim, embed_dim, key=keys[0])
+        
         self.shift_proj = eqx.nn.Linear(embed_dim, embed_dim, key=keys[1])
 
     @typecheck
@@ -51,10 +63,22 @@ class PatchEmbedding(eqx.Module):
         key: PRNGKeyArray
     ):
         keys = jr.split(key, 3)
+
         self.patch_size = patch_size
-        self.proj = eqx.nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size, key=keys[0])
-        self.cls_token = jr.normal(keys[1], (1, embed_dim)) # extra 1 before
-        self.pos_embed = jr.normal(keys[2], (int(img_size / patch_size) ** 2 + 1, embed_dim))
+
+        n_patches = int(img_size / patch_size) ** 2 + 1
+
+        self.proj = eqx.nn.Conv2d(
+            in_channels, 
+            embed_dim, 
+            kernel_size=patch_size, 
+            stride=patch_size, 
+            key=keys[0]
+        )
+
+        self.cls_token = jr.normal(keys[1], (1, embed_dim)) 
+
+        self.pos_embed = jr.normal(keys[2], (n_patches, embed_dim))
 
     @typecheck
     def __call__(self, x: Float[Array, "_ _ _"]) -> Float[Array, "s q"]:
@@ -102,9 +126,13 @@ class TransformerBlock(eqx.Module):
         key: PRNGKeyArray
     ):
         keys = jr.split(key, 5)
+
         self.norm1 = AdaLayerNorm(embed_dim, key=keys[0])
+
         self.attn = eqx.nn.MultiheadAttention(n_heads, embed_dim, key=keys[1]) # NOTE: Casting in here...
+
         self.norm2 = AdaLayerNorm(embed_dim, key=keys[2])
+
         self.mlp = eqx.nn.Sequential(
             [
                 eqx.nn.Linear(embed_dim, embed_dim * 4, key=keys[3]),
@@ -151,16 +179,18 @@ class DiT(eqx.Module):
         self.q_dim = q_dim
 
         keys = jr.split(key, 5)
-        channels = channels + q_dim if (q_dim is not None) else channels
+
+        channels = channels + q_dim if exists(q_dim) else channels
 
         self.patch_embed = PatchEmbedding(
             img_size, patch_size, channels, embed_dim, key=keys[0]
         )
+
         self.time_embed = TimestepEmbedding(embed_dim, key=keys[1])
         
         self.a_embed = eqx.nn.Linear(
             a_dim, embed_dim, key=keys[2]
-        ) if (a_dim is not None) else None
+        ) if exists(a_dim) else None
 
         block_keys = jr.split(keys[3], depth)
         self.blocks = eqx.filter_vmap(
@@ -182,8 +212,8 @@ class DiT(eqx.Module):
         self, 
         t: Scalar, 
         x: XArray, 
-        q: QArray, 
-        a: AArray,
+        q: Optional[QArray] = None, 
+        a: Optional[QArray] = None, 
         key: Optional[PRNGKeyArray] = None
     ) -> Float[Array, "_ _ _"]:
 
@@ -192,12 +222,12 @@ class DiT(eqx.Module):
 
         x = self.patch_embed(
             jnp.concatenate([x, q]) 
-            if (q is not None) and (self.q_dim is not None)
+            if exists(q) and exists(self.q_dim)
             else x
         )
 
         t_embedding = self.time_embed(t)
-        if (a is not None) and (self.a_dim is not None):
+        if exists(a) and exists(self.a_dim):
             a_embedding = self.a_embed(a)
             embedding = a_embedding + t_embedding
         else:
@@ -222,7 +252,7 @@ class DiT(eqx.Module):
 
         x = self.out_conv(
             jnp.concatenate([x, q]) 
-            if (q is not None) and (self.q_dim is not None)
+            if exists(q) and exists(self.q_dim)
             else x
         )
 

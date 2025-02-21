@@ -1,5 +1,6 @@
 import os
-from typing import Optional, Union, Literal
+import abc
+from typing import Optional, Union, Generator
 from shutil import rmtree
 
 import jax
@@ -7,19 +8,15 @@ import jax.numpy as jnp
 import jax.random as jr
 import equinox as eqx
 import optax
-from jaxtyping import PRNGKeyArray, Array, Float, jaxtyped
-from beartype import beartype as typechecker
+from einops import rearrange
 from PIL import Image
 import matplotlib.pyplot as plt
 from sklearn.datasets import make_moons
 from sklearn.preprocessing import StandardScaler
 import tensorflow_probability.substrates.jax.distributions as tfd
-from tqdm import trange
+from datasets import load_dataset
 
-from custom_types import (
-    XArray, XCovariance, SDEType, 
-    SampleType, Datasets, typecheck
-)
+from custom_types import PRNGKeyArray, Array, Float, Datasets, typecheck
 
 EPS = None
 
@@ -42,6 +39,14 @@ def maybe_invert(cov_x):
     else:
         inv_cov_x = None
     return inv_cov_x
+
+
+def flatten(x: Array) -> Array:
+    return rearrange(x, "... c h w -> ... (h w c)")
+
+
+def unflatten(x: Array, height: int, width: int) -> Array:
+    return rearrange(x, "... (h, w, c) -> ... h w c", H=height, W=width)
 
 
 """
@@ -148,14 +153,18 @@ def get_opt_and_state(
     optax.GradientTransformationExtraArgs, optax.OptState
 ]:
     if use_lr_schedule:
-        n_steps_per_epoch = int(n_data / n_batch)
-
-        scheduler = optax.warmup_cosine_decay_schedule(
+        # n_steps_per_epoch = int(n_data / n_batch)
+        # scheduler = optax.warmup_cosine_decay_schedule(
+        #     init_value=initial_lr, 
+        #     peak_value=lr, 
+        #     warmup_steps=n_epochs_warmup * n_steps_per_epoch,
+        #     decay_steps=diffusion_iterations * n_steps_per_epoch, 
+        #     end_value=lr
+        # )
+        scheduler = optax.linear_schedule(
             init_value=initial_lr, 
-            peak_value=lr, 
-            warmup_steps=n_epochs_warmup * n_steps_per_epoch,
-            decay_steps=diffusion_iterations * n_steps_per_epoch, 
-            end_value=lr
+            end_value=lr,
+            transition_steps=diffusion_iterations
         )
     else:
         scheduler = None
@@ -179,11 +188,7 @@ def clip_latents(X, x_clip_limit):
 """
 
 
-def get_data(
-    key: PRNGKeyArray, 
-    n: int, 
-    dataset: Datasets
-) -> Float[Array, "n d"]:
+def get_data(key: PRNGKeyArray, n: int, dataset: Datasets) -> Float[Array, "n d"]:
 
     if dataset == "blob":
         X = jr.multivariate_normal(
@@ -194,11 +199,11 @@ def get_data(
         key_0, key_1 = jr.split(key)
 
         X_0 = jr.multivariate_normal(
-            key_0, mean=jnp.ones((2,)) * 0.5, cov=jnp.identity(2) * 0.1, shape=(n // 2,)
+            key_0, mean=jnp.ones((2,)) * 1., cov=jnp.identity(2) * 0.05, shape=(n // 2,)
         )
 
         X_1 = jr.multivariate_normal(
-            key_1, mean=jnp.ones((2,)) * -0.5, cov=jnp.identity(2) * 0.1, shape=(n // 2,)
+            key_1, mean=jnp.ones((2,)) * -1.0, cov=jnp.identity(2) * 0.05, shape=(n // 2,)
         )
 
         X = jnp.concatenate([X_0, X_1])
@@ -209,7 +214,8 @@ def get_data(
 
     if dataset == "gmm":
         N = 8 # Mixture components
-        alphas = jnp.linspace(0, 2. * jnp.pi * (1. - 1. / N), N)
+
+        alphas = jnp.linspace(0., 2. * jnp.pi * (1. - 1. / N), N)
         xs = jnp.cos(alphas)
         ys = jnp.sin(alphas)
         means = jnp.stack([xs, ys], axis=1)
@@ -227,6 +233,9 @@ def get_data(
         )
         X = gaussian_mixture.sample((n,), seed=key)
 
+    # NOTE: shuffle so a representative set are used / plotted in all cases
+    X = jr.choice(key, X, (n,)) # Shuffle
+
     # if dataset != "blob":
     #     s = StandardScaler() # Need to keep doing this for each EM's x|y?
     #     X = s.fit_transform(X)
@@ -241,3 +250,93 @@ def measurement(
 ) -> Float[Array, "d"]: 
     # Sample from G[y|x, cov_y]
     return jr.multivariate_normal(key, x, cov_y) 
+
+
+class _AbstractDataLoader(metaclass=abc.ABCMeta):
+    @abc.abstractmethod
+    def __init__(self, dataset, *, key):
+        pass
+
+    def __iter__(self):
+        raise RuntimeError("Use `.loop` to iterate over the data loader.")
+
+    @abc.abstractmethod
+    def loop(self, batch_size):
+        pass
+
+
+class InMemoryDataLoader(_AbstractDataLoader):
+    def __init__(
+        self, X: Array, *, key: PRNGKeyArray 
+    ):
+        self.X = X 
+        self.key = key
+
+    def loop(
+        self, 
+        batch_size: int, 
+        *, 
+        key: Optional[PRNGKeyArray] = None
+    ) -> Generator[Array, None, None]:
+        dataset_size = self.X.shape[0]
+        if batch_size > dataset_size:
+            raise ValueError("Batch size larger than dataset size")
+
+        key = key if exists(key) else self.key
+        indices = jnp.arange(dataset_size)
+        while True:
+            key, subkey = jr.split(key)
+            perm = jr.permutation(subkey, indices)
+            start = 0
+            end = batch_size
+            while end < dataset_size:
+                batch_perm = perm[start:end]
+                yield self.X[batch_perm]
+                start = end
+                end = start + batch_size
+
+
+def mnist(
+    key: PRNGKeyArray, 
+    img_size: int = 28,
+    n_samples: int = 100, # Testing
+    return_arrays: bool = True
+) -> tuple[InMemoryDataLoader, InMemoryDataLoader]:
+
+    key_train, key_valid = jr.split(key)
+
+    def _reshape_fn(imgs):
+        if img_size != 28:
+            imgs = jax.image.resize(
+                imgs, (imgs.shape[0], 1, img_size, img_size), method="bilinear"
+            )
+        return imgs
+
+    dataset = load_dataset("ylecun/mnist")
+    dataset = dataset.with_format("jax")
+
+    imgs = dataset["train"]["image"]
+    imgs = jnp.asarray(imgs)
+    imgs = imgs[:n_samples, jnp.newaxis, ...]
+    imgs = _reshape_fn(imgs)
+    imgs = (imgs - imgs.min()) / (imgs.max() - imgs.min())
+    train_dataloader = InMemoryDataLoader(imgs, key=key_train)
+
+    imgs = dataset["test"]["image"]
+    imgs = jnp.asarray(imgs)
+    imgs = imgs[:n_samples, jnp.newaxis, ...]
+    imgs = _reshape_fn(imgs)
+    imgs = (imgs - imgs.min()) / (imgs.max() - imgs.min())
+    valid_dataloader = InMemoryDataLoader(imgs, key=key_valid)
+
+    print("DATA:", imgs.shape, imgs.dtype, imgs.min(), imgs.max())
+
+    if return_arrays:
+        return imgs
+    else:
+        return train_dataloader, valid_dataloader
+
+
+def get_loader(X, key):
+    # Train loader only for now
+    return InMemoryDataLoader(X, key=key)

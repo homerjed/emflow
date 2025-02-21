@@ -3,7 +3,10 @@ __pycache__/
 *.pdf
 *.gif
 imgs/
-imgs_/
+imgs_*/
 *.png
 *.yml
 !assets/*.gif
+sgm/
+rf_mnist/
+rf/main_mnist.py
