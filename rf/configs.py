@@ -266,7 +266,7 @@ def get_mnist_config():
     # Train
     train = config.train = ConfigDict()
     # > Train on latents first to check flow works (discarding it)
-    train.test_on_latents      = True
+    train.test_on_latents      = False
     # > Iterations
     train.em_iterations        = 256 #64
     train.diffusion_iterations = 5_000
@@ -294,6 +294,16 @@ def get_mnist_config():
     train.accumulate_gradients = True
     train.n_minibatches        = 4
 
+    # Data
+    data = config.data = ConfigDict()
+    data.dataset              = "mnist"
+    data.img_size             = 28
+    data.data_dim             = data.img_size ** 2 # Same dimension, just masked partly
+    data.latent_dim           = data.img_size ** 2 
+    data.mask_fraction        = 0.75
+    data.n_data               = 100 # 60_000 NOTE: match this elsewhere
+    data.sigma_y              = 0.05
+
     # Model
     model = config.model = ConfigDict()
     model.model_type           = "dit"
@@ -305,12 +315,6 @@ def get_mnist_config():
     model.embed_dim            = 128
     model.soln_kwargs          = dict(t0=0., dt0=0.01, t1=1., solver=dfx.Euler()) # For ODE NOTE: this eps supposed to be bad idea
 
-    # Data
-    data = config.data = ConfigDict()
-    data.dataset              = "mnist"
-    data.data_dim             = model.img_size ** 2
-    data.n_data               = 100 # 60_000 NOTE: match this elsewhere
-    data.sigma_y              = 0.05
 
     assert config.data.dataset in ["gmm", "moons", "blob", "double-blob", "mnist"]
     assert config.train.sampling_mode in ["ddim", "ode", "sde"]

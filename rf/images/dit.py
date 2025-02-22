@@ -5,7 +5,7 @@ import jax.random as jr
 import equinox as eqx
 from einops import rearrange
 
-from custom_types import PRNGKeyArray, XArray, Array, Float, Scalar, typecheck
+from custom_types import PRNGKeyArray, XImage, Array, Float, Scalar, typecheck
 
 QArray = Float[Array, "..."]
 
@@ -214,13 +214,11 @@ class DiT(eqx.Module):
     def __call__(
         self, 
         t: Scalar, 
-        x: XArray, 
+        x: XImage, 
         q: Optional[QArray] = None, 
         a: Optional[QArray] = None, 
         key: Optional[PRNGKeyArray] = None
     ) -> Float[Array, "_ _ _"]:
-
-        x = jnp.reshape(x, self.img_shape) # Most of EM stuff requires flat vectors
 
         if exists(self.scaler):
             x, q, a = self.scaler.forward(x, q, a)

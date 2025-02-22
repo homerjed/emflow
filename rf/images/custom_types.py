@@ -5,9 +5,13 @@ from beartype import beartype as typechecker
 
 typecheck = jaxtyped(typechecker=typechecker)
 
+YImage = Float[Array, "_ _ _"]
+
 YArray = Float[Array, "y"] 
 
 YCovariance = Float[Array, "y y"] 
+
+XImage = Float[Array, "_ _ _"]
 
 XArray = Float[Array, "x"] 
 
@@ -22,6 +26,8 @@ OperatorMatrix = Int[Array, "y x"]
 XSampleFn = Callable[[PRNGKeyArray], XArray]
 
 XYSampleFn = Callable[[PRNGKeyArray, YArray, Optional[OperatorMatrix]], XArray]
+
+PostProcessFn = Optional[Callable[[Array], XArray]]
  
 SDEType = Literal["non-singular", "zero-ends", "singular", "gamma"]
 

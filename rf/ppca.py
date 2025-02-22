@@ -14,7 +14,7 @@ from custom_types import (
 )
 from rf import RectifiedFlow
 from sample import get_x_y_sampler
-from utils import plot_losses_ppca
+from utils import plot_losses_ppca, maybe_shard
 
 
 def gaussian_log_prob(x: XArray, mu_x: XArray, cov_x: XCovariance) -> Scalar:
@@ -76,16 +76,20 @@ def run_ppca(
     mode: Literal["cg", "full"] = "full",
     sde_type: SDEType, 
     sampling_mode: SampleType,
+    replicated_sharding: Optional[jax.sharding.NamedSharding] = None,
+    distributed_sharding: Optional[jax.sharding.NamedSharding] = None,
     X: Optional[Float[Array, "n x"]] = None, # Only for loss, debugging
     save_dir: str = None
 ) -> tuple[XArray, XCovariance, Float[Array, "n x"]]:
+
+    flow = maybe_shard(flow, replicated_sharding)
 
     n_data, data_dim = Y.shape
 
     mu_x = jnp.zeros(latent_dim)
     cov_x = jnp.identity(latent_dim) # Start at cov_y?
 
-    X_Y = Y
+    X_Y = maybe_shard(Y, distributed_sharding)
 
     log_probs_x = []
     with trange(
@@ -106,6 +110,8 @@ def run_ppca(
             )
             keys = jr.split(key_sample, n_data)
             X_Y = jax.vmap(sampler)(keys, Y, A)
+
+            X_Y = maybe_shard(X_Y, distributed_sharding)
 
             mu_x, cov_x = ppca(X_Y, key_pca, rank=data_dim)
 

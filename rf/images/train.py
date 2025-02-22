@@ -13,9 +13,9 @@ from einops import rearrange
 import matplotlib.pyplot as plt
 from tqdm import trange
 
-from custom_types import XArray, SDEType, typecheck
+from custom_types import SDEType, PostProcessFn, typecheck
 from rf import RectifiedFlow, cosine_time, identity
-from sample import get_non_singular_sample_fn, single_sample_fn_ode
+from sample import get_non_singular_sample_fn, single_sample_fn_ode, get_x_sampler
 from utils import exists, get_opt_and_state, maybe_shard, flatten
 from soap import soap
 
@@ -55,7 +55,7 @@ def time_sampler(
     return t
 
 
-def mse(x: XArray, y: XArray) -> XArray:
+def mse(x: Array, y: Array) -> Array:
     return jnp.square(jnp.subtract(x, y))
 
 
@@ -210,9 +210,11 @@ def test_train(
     use_ema: bool, 
     ema_rate: float, 
     sde_type: SDEType, 
-    replicated_sharding: Optional[jax.sharding.NamedSharding],
-    distributed_sharding: Optional[jax.sharding.NamedSharding],
-    save_dir: str
+    postprocess_fn: PostProcessFn,
+    img_size: int = 28,
+    replicated_sharding: Optional[jax.sharding.NamedSharding] = None,
+    distributed_sharding: Optional[jax.sharding.NamedSharding] = None,
+    save_dir: Optional[str] = None
 ) -> None:
     # Test whether training config fits FM model on latents
 
@@ -221,8 +223,11 @@ def test_train(
 
     opt, opt_state = get_opt_and_state(flow, soap, lr=lr)
 
+    flow, opt_state = maybe_shard((flow, opt_state), replicated_sharding)
+
     if use_ema:
         ema_flow = deepcopy(flow)
+        ema_flow = maybe_shard(ema_flow, replicated_sharding)
 
     key_steps, key_sample = jr.split(key)
 
@@ -237,12 +242,14 @@ def test_train(
 
             L, flow, key, opt_state = make_step(
                 flow, 
-                flatten(x), 
+                x, 
                 key_step, 
                 opt_state, 
                 opt.update, 
                 loss_type="mse", 
-                time_schedule=identity
+                time_schedule=identity,
+                replicated_sharding=replicated_sharding,
+                distributed_sharding=distributed_sharding
             )
 
             if use_ema:
@@ -252,26 +259,20 @@ def test_train(
             steps.set_postfix_str("L={:.3E}".format(L))
 
     # Generate latents from q(x)
-    keys = jr.split(key_sample, 8000)
-    X_test_sde = jax.vmap(get_non_singular_sample_fn(flow))(keys)
-    X_test_ode = jax.vmap(partial(single_sample_fn_ode, flow, sde_type=sde_type))(keys)
+    n_sample = 16
+    keys = jr.split(key_sample, n_sample)
 
-    if X_test_ode.ndim > 2:
-        X = rearrange(X, "(p q) c h w -> (p h) (q w) c")
-        X_Y = rearrange(X_Y, "(p q) c h w -> (p h) (q w) c")
-        Y = rearrange(Y, "(p q) c h w -> (p h) (q w) c")
-        X_ = rearrange(X_, "(p q) c h w -> (p h) (q w) c")
-        fig, axs = plt.subplots(2, 2, figsize=(9., 9.), dpi=200)
-        for ax, arr in zip(axs.ravel(), (X, X_Y, Y, X_)):
-            ax.imshow(arr, cmap="gray_r")
-            ax.axis("off")
-        plt.savefig(os.path.join(save_dir, "test.png"))
-        plt.close()
-    else:
-        plt.figure(figsize=(5., 5.))
-        plt.scatter(*X.T, s=0.1, color="k")
-        plt.scatter(*X_test_sde.T, s=0.1, color="b", label="sde")
-        plt.scatter(*X_test_ode.T, s=0.1, color="r", label="ode {}".format(sde_type))
-        plt.legend(frameon=False)
-        plt.savefig(os.path.join(save_dir, "test.png"))
-        plt.close()
+    sampler = get_x_sampler(
+        flow, sampling_mode="ode", sde_type=sde_type, postprocess_fn=postprocess_fn
+    )
+    X_test_ode = jax.vmap(sampler)(keys)
+
+    X = rearrange(X[:n_sample], "(p q) c h w -> (p h) (q w) c", p=4, q=4)
+    X_test_ode = rearrange(X_test_ode, "(p q) (c h w) -> (p h) (q w) c", p=4, q=4, c=1, h=img_size, w=img_size)
+
+    fig, axs = plt.subplots(1, 2, figsize=(9., 4.), dpi=200)
+    for ax, arr in zip(axs.ravel(), (X, X_test_ode)):
+        ax.imshow(arr, cmap="gray_r")
+        ax.axis("off")
+    plt.savefig(os.path.join(save_dir, "test.png"))
+    plt.close()

@@ -8,7 +8,7 @@ import equinox as eqx
 import diffrax as dfx
 from jaxtyping import PRNGKeyArray, Array, Float, Scalar
 
-from custom_types import XArray, SDEType, typecheck
+from custom_types import XImage, SDEType, typecheck
 from utils import exists, maybe_clip
 from resnet import ResidualNetwork
 from dit import DiT
@@ -55,9 +55,9 @@ class RectifiedFlow(eqx.Module):
     net: eqx.Module
     time_embedder: Optional[Callable]
 
-    x_shape: tuple[int]
-    x_dim: int # Sample shape
-    sample_shape: tuple[int]
+    x_shape: tuple[int]   # Flattened image shape (scoring etc)
+    x_dim: int            # Image size (elements)
+    img_shape: tuple[int] # Shape of sampling
 
     t0: float
     dt0: float
@@ -80,7 +80,7 @@ class RectifiedFlow(eqx.Module):
         self.time_embedder = time_embedder
         self.x_shape = x_shape
         self.x_dim = math.prod(x_shape)
-        self.sample_shape = (self.x_dim,)
+        self.img_shape = net.img_shape
         self.t0 = t0
         self.dt0 = dt0
         self.t1 = t1
@@ -105,20 +105,20 @@ class RectifiedFlow(eqx.Module):
         return jnp.identity(self.x_dim) * jnp.square(jnp.maximum(t, 1e-5))
 
     @typecheck
-    def p_t(self, x_0: XArray, t: Scalar, eps: XArray) -> XArray:
+    def p_t(self, x_0: XImage, t: Scalar, eps: XImage) -> XImage:
         return self.alpha(t) * x_0 + self.sigma(t) * eps # NOTE: add eps to sigma(t) here so x_t=0 = x_0 + deps
 
     @typecheck
     def sde(
         self, 
-        x: XArray, 
+        x: XImage, 
         t: Scalar, 
         *,
         alpha: float = 1., # NOTE: not alpha_t
         return_score: bool = False,
         sde_type: SDEType = "zero-ends"
     ) -> Union[
-        tuple[XArray, Scalar], tuple[XArray, Scalar, XArray]
+        tuple[XImage, Scalar], tuple[XImage, Scalar, XImage]
     ]:
         assert sde_type in ["non-singular", "zero-ends", "singular", "gamma"], "sde_type={}".format(sde_type)
 
@@ -149,26 +149,26 @@ class RectifiedFlow(eqx.Module):
     @typecheck
     def reverse_ode(
         self, 
-        x: XArray, 
+        x: XImage, 
         t: Scalar, 
-        score: Optional[XArray], 
+        score: Optional[XImage], 
         *,
         alpha: float = 1., # NOTE: not alpha_t
         sde_type: SDEType = "zero-ends"
-    ) -> XArray:
+    ) -> XImage:
         drift, diffusion = self.sde(
             x, t, alpha=alpha, sde_type=sde_type
         ) 
         return drift - 0.5 * jnp.square(diffusion) * score # Posterior score
 
     @typecheck
-    def v(self, t: Scalar, x: XArray) -> XArray:
+    def v(self, t: Scalar, x: XImage) -> XImage:
         if exists(self.time_embedder):
             t = self.time_embedder(t)
         return self.net(t, x)
 
     @typecheck
-    def __call__(self, t: Scalar, x: XArray) -> XArray:
+    def __call__(self, t: Scalar, x: XImage) -> XImage:
         return self.v(t, x)
 
 
@@ -181,9 +181,9 @@ class RectifiedFlow(eqx.Module):
 def velocity_to_score(
     flow: Optional[RectifiedFlow], 
     t: Scalar, 
-    x: XArray, 
-    velocity: Optional[XArray] = None
-) -> XArray:
+    x: XImage, 
+    velocity: Optional[XImage] = None
+) -> XImage:
     # Convert velocity predicted by flow to score of its SDE 
     assert not ((velocity is not None) and (flow is not None))
     v = flow.v(t, x) if exists(flow) else velocity
@@ -192,10 +192,10 @@ def velocity_to_score(
 
 @typecheck
 def score_to_velocity(
-    score: Optional[XArray],
+    score: Optional[XImage],
     t: Scalar, 
-    x: XArray 
-) -> XArray:
+    x: XImage 
+) -> XImage:
     # Convert score associated with velocity of flow
     return -(score * t + x) / maybe_clip(1. - t) 
 

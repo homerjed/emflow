@@ -16,6 +16,7 @@ from sklearn.datasets import make_moons, make_swiss_roll
 from sklearn.preprocessing import StandardScaler
 import tensorflow_probability.substrates.jax.distributions as tfd
 from datasets import load_dataset
+from ml_collections import ConfigDict
 
 from custom_types import PRNGKeyArray, Array, Float, PyTree, XCovariance, Datasets, typecheck
 
@@ -46,8 +47,9 @@ def flatten(x: Array) -> Array:
     return rearrange(x, "... c h w -> ... (h w c)")
 
 
-def unflatten(x: Array, height: int, width: int) -> Array:
-    return rearrange(x, "... (h, w, c) -> ... h w c", h=height, w=width)
+def unflatten(x: Array, img_shape: tuple[int]) -> Array:
+    c, h, w = img_shape
+    return rearrange(x, "... (h w c) -> ... c h w", h=h, w=w, c=c)
 
 
 """
@@ -109,36 +111,20 @@ def plot_losses_ppca(losses, save_dir="imgs/"):
     plt.close()
 
 
-def plot_samples(X, X_Y, Y, X_, dataset, n_plot=8000, iteration=0, save_dir="imgs/"):
-    plot_kwargs = dict(s=0.08, marker=".")
-    fig, axs = plt.subplots(2, 1, figsize=(4., 9.), dpi=200)
-    ax = axs[0]
-    ax.set_title("EM: iteration {}".format(iteration))
-    ax.scatter(*X[:n_plot].T, color="k", label=r"$x\sim p(x)$", **plot_kwargs)
-    ax.scatter(*X_Y[:n_plot].T, color="b", label=r"$x\sim p_{\theta}(x|y)$", **plot_kwargs) 
-    ax.scatter(*Y[:n_plot].T, color="r", label=r"$y\sim p(y|x)$", **plot_kwargs) 
-    legend = ax.legend(frameon=False, loc="upper right")
-    legend.get_texts()[0].set_color("k") 
-    legend.get_texts()[1].set_color("b") 
-    legend.get_texts()[2].set_color("r") 
-    ax = axs[1]
-    ax.scatter(*X[:n_plot].T, color="k", label=r"$x\sim p(x)$", **plot_kwargs) 
-    ax.scatter(*X_[:n_plot].T, color="b", label=r"$x\sim p_{\theta}(x)$", **plot_kwargs) 
-    legend = ax.legend(frameon=False, loc="upper right")
-    legend.get_texts()[0].set_color("k") 
-    legend.get_texts()[1].set_color("b") 
-    for ax in axs:
-        ax.set_xlim(-2.5, 2.5)
-        ax.set_ylim(-2.5, 2.5)
+def plot_samples(X, X_Y, Y, X_, iteration=0, save_dir="imgs/"):
+
+    X = rearrange(X[:16], "(p q) c h w -> (p h) (q w) c", p=4, q=4)
+    X_Y = rearrange(X_Y[:16], "(p q) (c h w) -> (p h) (q w) c", p=4, q=4, h=28, w=28)
+    Y = rearrange(Y[:16], "(p q) (c h w) -> (p h) (q w) c", p=4, q=4, h=28, w=28)
+    X_ = rearrange(X_[:16], "(p q) (c h w) -> (p h) (q w) c", p=4, q=4, h=28, w=28)
+
+    fig, axs = plt.subplots(2, 2, figsize=(9., 9.), dpi=200)
+    for ax, arr, title in zip(
+        axs.ravel(), (X, Y, X_Y, X_), ("X", "Y", "X|Y", "X'")
+    ):
+        ax.set_title(title)
+        ax.imshow(arr, cmap="gray_r")
         ax.axis("off")
-        # X = rearrange(X, "(p q) c h w -> (p h) (q w) c")
-        # X_Y = rearrange(X_Y, "(p q) c h w -> (p h) (q w) c")
-        # Y = rearrange(Y, "(p q) c h w -> (p h) (q w) c")
-        # X_ = rearrange(X_, "(p q) c h w -> (p h) (q w) c")
-        # fig, axs = plt.subplots(2, 2, figsize=(9., 9.), dpi=200)
-        # for ax, arr in zip(axs.ravel(), (X, X_Y, Y, X_)):
-        #     ax.imshow(arr, cmap="gray_r")
-        #     ax.axis("off")
     plt.savefig(
         os.path.join(save_dir, "samples_{:04d}.png".format(iteration)), 
         bbox_inches="tight"
@@ -186,14 +172,6 @@ def get_opt_and_state(
     optax.GradientTransformationExtraArgs, optax.OptState
 ]:
     if use_lr_schedule:
-        # n_steps_per_epoch = int(n_data / n_batch)
-        # scheduler = optax.warmup_cosine_decay_schedule(
-        #     init_value=initial_lr, 
-        #     peak_value=lr, 
-        #     warmup_steps=n_epochs_warmup * n_steps_per_epoch,
-        #     decay_steps=diffusion_iterations * n_steps_per_epoch, 
-        #     end_value=lr
-        # )
         scheduler = optax.linear_schedule(
             init_value=initial_lr, 
             end_value=lr,
@@ -236,9 +214,10 @@ class _AbstractDataLoader(metaclass=abc.ABCMeta):
 
 class InMemoryDataLoader(_AbstractDataLoader):
     def __init__(
-        self, X: Array, *, key: PRNGKeyArray 
+        self, X: Array, A: Optional[Array] = None, *, key: PRNGKeyArray 
     ):
         self.X = X 
+        self.A = A 
         self.key = key
 
     def loop(
@@ -260,20 +239,26 @@ class InMemoryDataLoader(_AbstractDataLoader):
             end = batch_size
             while end < dataset_size:
                 batch_perm = perm[start:end]
-                yield self.X[batch_perm]
+                yield (
+                    (self.X[batch_perm], self.A[batch_perm]) 
+                    if exists(self.A) 
+                    else self.X[batch_perm]
+                )
                 start = end
                 end = start + batch_size
 
 
-def get_loader(X, key):
+def get_loader(
+    X: Array, A: Optional[Array] = None, *, key: PRNGKeyArray
+) -> InMemoryDataLoader:
     # Train loader only for now
-    return InMemoryDataLoader(X, key=key)
+    return InMemoryDataLoader(X, A, key=key)
 
 
 def mnist(
     key: PRNGKeyArray, 
     img_size: int = 28,
-    n_samples: int = 100, # Testing
+    n_samples: int = 1000, # Testing
     return_arrays: bool = True
 ) -> tuple[InMemoryDataLoader, InMemoryDataLoader]:
 
@@ -293,17 +278,17 @@ def mnist(
     imgs = jnp.asarray(imgs)
     imgs = imgs[:n_samples, jnp.newaxis, ...]
     imgs = _reshape_fn(imgs)
-    imgs_t = (imgs - imgs.min()) / (imgs.max() - imgs.min())
+    imgs_t = 2. * (imgs - imgs.min()) / (imgs.max() - imgs.min()) - 1.
     train_dataloader = InMemoryDataLoader(imgs_t, key=key_train)
 
     imgs = dataset["test"]["image"]
     imgs = jnp.asarray(imgs)
     imgs = imgs[:n_samples, jnp.newaxis, ...]
     imgs = _reshape_fn(imgs)
-    imgs_v = (imgs - imgs.min()) / (imgs.max() - imgs.min())
+    imgs_v = 2. * (imgs - imgs.min()) / (imgs.max() - imgs.min()) - 1.
     valid_dataloader = InMemoryDataLoader(imgs_v, key=key_valid)
 
-    print("DATA:", imgs.shape, imgs.dtype, imgs.min(), imgs.max())
+    print("DATA:", imgs.shape, imgs_t.dtype, imgs_t.min(), imgs_t.max())
 
     del imgs
 
@@ -313,106 +298,31 @@ def mnist(
         return train_dataloader, valid_dataloader
 
 
-def get_data(key: PRNGKeyArray, n: int, dataset: Datasets) -> Float[Array, "n d"]:
+def get_data(key: PRNGKeyArray, config: ConfigDict) -> Float[Array, "n _ _ _"]:
 
-    if dataset == "blob":
-        X = jr.multivariate_normal(
-            key, mean=jnp.ones((2,)), cov=jnp.identity(2) * 0.1, shape=(n,)
-        )
-        A = None
+    if config.data.dataset == "mnist":
+        key_X, key_A = jr.split(key)
 
-    if dataset == "double-blob":
-        key_0, key_1 = jr.split(key)
-
-        X_0 = jr.multivariate_normal(
-            key_0, mean=jnp.ones((2,)) * 1., cov=jnp.identity(2) * 0.05, shape=(n // 2,)
+        X = mnist(
+            key_X, 
+            img_size=config.data.img_size, 
+            n_samples=config.data.n_data, 
+            return_arrays=True
         )
 
-        X_1 = jr.multivariate_normal(
-            key_1, mean=jnp.ones((2,)) * -1.0, cov=jnp.identity(2) * 0.05, shape=(n // 2,)
-        )
+        n_data, *img_dim = X.shape 
+        img_dim = math.prod(img_dim)
 
-        X = jnp.concatenate([X_0, X_1])
-        A = None
+        def binary_mask(key):
+            zeros = jnp.zeros((int((1. - config.data.mask_fraction) * img_dim),))
+            ones = jnp.ones((int(config.data.mask_fraction * img_dim),))
+            ones_and_zeros = jnp.concatenate([zeros, ones])
+            return jnp.diag(jr.permutation(key, ones_and_zeros))
 
-    if dataset == "moons":
-        seed = int(jnp.sum(jr.key_data(key)))
-        X, _ = make_moons(n, noise=0.04, random_state=seed)
-        A = None
+        keys = jr.split(key_A, n_data)
+        A = jax.vmap(binary_mask)(keys).astype(jnp.int32)
 
-    if dataset == "gmm":
-        N = 8 # Mixture components
-
-        alphas = jnp.linspace(0., 2. * jnp.pi * (1. - 1. / N), N)
-        xs = jnp.cos(alphas)
-        ys = jnp.sin(alphas)
-        means = jnp.stack([xs, ys], axis=1)
-
-        gaussian_mixture = tfd.Mixture(
-            cat=tfd.Categorical(
-                probs=jnp.ones((means.shape[0])) / means.shape[0]
-            ),
-            components=[
-                tfd.MultivariateNormalDiag(
-                    loc=mu, scale_diag=jnp.ones_like(mu) * 0.1
-                )
-                for mu in means
-            ]
-        )
-        X = gaussian_mixture.sample((n,), seed=key)
-        A = None
-
-    if dataset == "spiral":
-        X, _ = make_swiss_roll(n, noise=0.01)  # X is (n_samples, 3)
-        X = 2. * (X - X.min()) / (X.max() - X.min()) - 1.  # Normalize to [0, 1]
-        A = None
-
-        # fig = plt.figure(figsize=(12, 5))
-        # ax = fig.add_subplot(121, projection='3d')
-        # ax.scatter(X[:, 0], X[:, 1], X[:, 2], c=X[:, 0], cmap='Spectral')
-        # ax.set_title("Original 3D Swiss Roll")
-
-        # noise = np.random.normal(scale=0.02, size=(n_samples, 2))  # Gaussian noise
-        # Y = np.einsum("nij, nj -> ni", A, X) + noise  
-
-        # ax = fig.add_subplot(122)
-        # ax.scatter(Y[:, 0], Y[:, 1], c=X[:, 0], cmap='Spectral')
-        # ax.set_title("Projected & Noisy 2D Data")
-        # plt.show()
-
-    if dataset == "mnist":
-        X = mnist(key, img_size=28, return_arrays=True)
-        # A = jr.choice(
-        #     key, 
-        #     jnp.array([0, 1]), 
-        #     p=jnp.array([0.75, 1. - 0.75]),
-        #     shape=(X.shape[0], math.prod(X.shape[1:]))
-        # )
-        img_dim = math.prod(X.shape[1:])
-        A = jr.permutation(
-            key, 
-            jnp.stack([jnp.array([0.] * int(0.75 * img_dim) + [1.] * int(0.25 * img_dim))] * X.shape[0]),
-            independent=True
-        )
-        A = jax.vmap(jnp.diag)(A).astype(jnp.int32)
-
-    # NOTE: shuffle so a representative set are used / plotted in all cases
-    X = jr.permutation(key, X)
-
-    # if dataset != "blob":
-    #     s = StandardScaler() # Need to keep doing this for each EM's x|y?
-    #     X = s.fit_transform(X)
-
-    return jnp.asarray(X), A
-
-
-def get_A(key: PRNGKeyArray, latent_dim: int = 3, observed_dim: int = 2) -> Float[Array, "y x"]:
-    # Generate corruption matrix A, data_dim is latent variable size
-    # one_and_zeros = jnp.array([1.] * observed_dim + [0.] * (latent_dim - observed_dim)) # Assuming n 
-    # A = jnp.diag(jr.permutation(key, one_and_zeros,))
-    idx = jr.choice(key, latent_dim, shape=(observed_dim,), replace=False)  # Sample m indices
-    A = jnp.zeros((observed_dim, latent_dim)).at[jnp.arange(observed_dim), idx].set(1)
-    return A.astype(jnp.int32)
+    return X, A
 
 
 def measurement(

@@ -1,5 +1,5 @@
 
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, Any
 from functools import partial
 import jax
 import jax.numpy as jnp
@@ -11,7 +11,9 @@ from custom_types import (
     typecheck
 )
 from rf import RectifiedFlow, velocity_to_score
-from utils import maybe_clip, exists
+from utils import maybe_clip, exists, flatten, unflatten
+
+Solver = Any #lineax.AbstractLinearSolver
 
 
 """
@@ -48,7 +50,9 @@ def get_E_x_x_t(
 ) -> XArray: 
     # Get E[x|x_t] from RF E[x_1 - x_0|x_t]; Eq 55, 
     # Appendix B.1 (E[x|x_t]=x_t-t*E[x_1-x|x_t])
-    return x_t - t * flow.v(t, x_t)
+    x_t = unflatten(x_t, flow.img_shape)
+    E_x_x_t = x_t - t * flow.v(t, x_t)
+    return flatten(E_x_x_t)
 
 
 @typecheck
@@ -61,7 +65,7 @@ def get_cov_t(flow: RectifiedFlow, t: Scalar) -> TCovariance:
 
 
 @typecheck
-def get_score_y_x(
+def get_score_x_y(
     y_: YArray, # Data
     A: Optional[OperatorMatrix],
     x: XArray, # x_t
@@ -79,6 +83,9 @@ def get_score_y_x(
     alpha_t = flow.alpha(t)
     cov_t = get_cov_t(flow, t)
 
+    # x = jnp.reshape(x, flow.img_shape)
+    x = unflatten(x, flow.img_shape)
+
     score_x = velocity_to_score(flow, t, x)
 
     E_x_x_t, J_E_x_x_t = value_and_jacfwd(get_E_x_x_t, x, flow=flow, t=t)
@@ -91,10 +98,9 @@ def get_score_y_x(
         [J_E_x_x_t, jnp.linalg.inv(V_y_x_t), y_ - E_x_x_t] # Eq 20, EMdiff
     )
 
-    if return_score_x:
-        return score_y_x, score_x
-    else:
-        return score_y_x
+    score_x_y = score_y_x + score_x
+
+    return score_x_y
 
 
 @typecheck
@@ -145,7 +151,7 @@ def get_score_gaussian_y_x_cg(
     max_steps: int = 100,
     tol: float = 1e-5, 
     return_score_x: bool = False,
-    solver: lineax.CG | lineax.BiCGStab | lineax.NormalCG = lineax.CG
+    solver: Solver = lineax.CG #lineax.CG | lineax.BiCGStab | lineax.NormalCG = lineax.CG
 ) -> Union[XArray, tuple[XArray, XArray]]:
    # Use lineax for CG, only can use this function (so far) with (y, A)
 
@@ -180,23 +186,23 @@ def get_score_gaussian_y_x_cg(
     # So why just this? NOTE: ALPHA_T PROBABLY SHOULD BE IN HERE TOO
     cov_y_x_t = lambda v: cov_y @ v + var_t * A_fn(*vjp(A_T(v)))
 
-    vector = y_ - y # y - A @ E[x|x_t]
-    operator = lineax.FunctionLinearOperator(
-        cov_y_x_t, 
-        input_structure=jax.ShapeDtypeStruct(y.shape, jnp.float32),
-        tags=(lineax.positive_semidefinite_tag, lineax.symmetric_tag)
-    )
-    _solver = lineax.CG(rtol=tol, atol=tol, max_steps=max_steps)
-    solution = lineax.linear_solve(operator, vector, solver=_solver)
-    v = solution.value
-
     # vector = y_ - y # y - A @ E[x|x_t]
-    # v, _ = jax.scipy.sparse.linalg.cg(
-    #     A=cov_y_x_t,
-    #     b=vector,
-    #     tol=tol,
-    #     maxiter=max_steps,
+    # operator = lineax.FunctionLinearOperator(
+    #     cov_y_x_t, 
+    #     input_structure=jax.ShapeDtypeStruct(y.shape, jnp.float32),
+    #     tags=(lineax.positive_semidefinite_tag, lineax.symmetric_tag)
     # )
+    # _solver = lineax.CG(rtol=tol, atol=tol, max_steps=max_steps)
+    # solution = lineax.linear_solve(operator, vector, solver=_solver)
+    # v = solution.value
+
+    vector = y_ - y # y - A @ E[x|x_t]
+    v, _ = jax.scipy.sparse.linalg.cg(
+        A=cov_y_x_t,
+        b=vector,
+        tol=tol,
+        maxiter=max_steps,
+    )
 
     (score_p_y_x_t,) = vjp(A_T(v))
 
@@ -243,7 +249,10 @@ def get_score_gaussian_x_y_cg(
     flow: RectifiedFlow,
     cov_y: YCovariance,
     mu_x: XArray,
-    inv_cov_x: XCovariance
+    inv_cov_x: XCovariance,
+    *,
+    max_steps: int = 2,
+    tol: float = 1e-5
 ) -> XArray:
 
     alpha_t = flow.alpha(t)
@@ -254,7 +263,16 @@ def get_score_gaussian_x_y_cg(
     score_x = (x + jnp.dot(cov_t @ inv_cov_x, x - mu_x)) / maybe_clip(alpha_t) 
 
     score_y_x = get_score_gaussian_y_x_cg(
-        y_, A, x, t, flow, cov_y, mu_x, inv_cov_x
+        y_, 
+        A, 
+        x, 
+        t, 
+        flow, 
+        cov_y, 
+        mu_x, 
+        inv_cov_x, 
+        tol=tol, 
+        max_steps=max_steps
     )
 
     score_x_y = score_y_x + score_x
@@ -273,6 +291,7 @@ def transpose(A: OperatorFn, x: XArray) -> OperatorFn:
     return A_T
 
 
+@typecheck
 def get_score_y_x_cg(
     y_: YArray, 
     A: Optional[OperatorMatrix | OperatorFn],
@@ -285,7 +304,7 @@ def get_score_y_x_cg(
     max_steps: int = 100,
     tol: float = 1e-5, 
     return_score_x: bool = False,
-    solver: lineax.CG | lineax.BiCGStab | lineax.NormalCG = lineax.CG
+    solver: Solver = lineax.CG #lineax.CG | lineax.BiCGStab | lineax.NormalCG = lineax.CG
 ) -> XArray:
    # Use lineax for CG, only can use this function (so far) with (y, A)
 
@@ -300,6 +319,7 @@ def get_score_y_x_cg(
     var_t = jnp.square(flow.sigma(t))
 
     E_x_x_t, vjp = jax.vjp(lambda x_t: get_E_x_x_t(x_t, flow, t), x) # Same as rozet; he returns x here
+
     y, A_fn = jax.linearize(A_fn, x) # This x wouldn't be score, its E[x|x_t]
     A_T = transpose(A_fn, x)
 
@@ -309,25 +329,25 @@ def get_score_y_x_cg(
     # else:
     #     cov_y_x_t = lambda v: cov_y @ v + cov_t * A_fn(*vjp(A_T(v)))
 
-    cov_y_x_t = lambda v: cov_y @ v + var_t * A(*vjp(A_T(v)))
-
-    vector = y_ - y # y - A @ E[x|x_t]
-    operator = lineax.FunctionLinearOperator(
-        cov_y_x_t, 
-        input_structure=jax.ShapeDtypeStruct(y.shape, dtype=jnp.float32), 
-        tags=(lineax.positive_semidefinite_tag, lineax.symmetric_tag)
-    )
-    _solver = solver(rtol=tol, atol=tol, max_steps=max_steps)
-    solution = lineax.linear_solve(operator, vector, solver=_solver)
-    v = solution.value
+    cov_y_x_t = lambda v: cov_y @ v + var_t * A_fn(*vjp(A_T(v))) # NOTE: var_t usable here?
 
     # vector = y_ - y # y - A @ E[x|x_t]
-    # v, _ = jax.scipy.sparse.linalg.cg(
-    #     A=cov_y_x_t,
-    #     b=vector,
-    #     tol=tol,
-    #     maxiter=max_steps,
+    # operator = lineax.FunctionLinearOperator(
+    #     cov_y_x_t, 
+    #     input_structure=jax.ShapeDtypeStruct(y.shape, dtype=jnp.float32), 
+    #     tags=(lineax.positive_semidefinite_tag, lineax.symmetric_tag)
     # )
+    # _solver = solver(rtol=tol, atol=tol, max_steps=max_steps)
+    # solution = lineax.linear_solve(operator, vector, solver=_solver)
+    # v = solution.value
+
+    vector = y_ - y # y - A @ E[x|x_t]
+    v, _ = jax.scipy.sparse.linalg.cg(
+        A=cov_y_x_t,
+        b=vector,
+        tol=tol,
+        maxiter=max_steps,
+    )
 
     (score_p_y_x_t,) = vjp(A_T(v)) # This is the derivative of the expectation.. => 3, 3 not 3...
 
@@ -335,3 +355,35 @@ def get_score_y_x_cg(
         return E_x_x_t + var_t * score_p_y_x_t, score_p_y_x_t # NOTE: this doesn't return score_x!
     else:
         return E_x_x_t + var_t * score_p_y_x_t
+
+
+@typecheck
+def get_score_x_y_cg(
+    y_: YArray, 
+    A: Optional[OperatorMatrix | OperatorFn],
+    x: XArray, # x_t
+    t: Scalar, 
+    flow: RectifiedFlow,
+    cov_x: XCovariance,
+    cov_y: YCovariance,
+    *,
+    max_steps: int = 100,
+    tol: float = 1e-5, 
+    return_score_x: bool = False,
+    solver: Solver = lineax.CG #lineax.CG | lineax.BiCGStab | lineax.NormalCG = lineax.CG
+) -> XArray:
+    score_p_y_x_t = get_score_y_x_cg(
+        y_, 
+        A, 
+        x, 
+        t, 
+        flow, 
+        cov_x, 
+        cov_y, 
+        max_steps=max_steps, 
+        tol=tol, 
+        solver=solver
+    )
+    score_p_x_x_t = velocity_to_score(flow, t, unflatten(x, flow.img_shape))
+    score_p_y_x_t = score_p_y_x_t + flatten(score_p_x_x_t)
+    return score_p_y_x_t

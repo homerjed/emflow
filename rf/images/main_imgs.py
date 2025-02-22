@@ -8,11 +8,7 @@ import jax.numpy as jnp
 import jax.random as jr
 from tqdm.auto import trange
 
-from configs import (
-    get_blob_config, get_double_blob_config, 
-    get_gmm_config, get_moons_config,
-    get_spiral_config, save_config
-)
+from configs import get_mnist_config, save_config
 from rf import get_rectified_flow
 from train import make_step, apply_ema, test_train
 from sample import get_x_sampler, get_x_y_sampler
@@ -20,10 +16,19 @@ from utils import (
     get_opt_and_state, clear_and_get_results_dir, 
     create_gif, plot_losses, plot_samples, 
     clip_latents, get_data, measurement,
-    get_loader, get_A, get_shardings,
-    maybe_shard, exists, flatten
+    get_loader, get_shardings, maybe_shard, 
+    exists, flatten, unflatten
 )
 from ppca import run_ppca
+
+from typing import NamedTuple
+
+class DataShapes(NamedTuple):
+    # Reshape to these where required
+    x_array: int
+    y_array: int
+    x_image: tuple[int]
+    y_image: tuple[int]
 
 
 if __name__ == "__main__":
@@ -34,7 +39,7 @@ if __name__ == "__main__":
 
     replicated_sharding, distributed_sharding = get_shardings()
 
-    config = get_moons_config() #get_spiral_config()
+    config = get_mnist_config()
 
     save_dir = clear_and_get_results_dir(
         save_dir="out/imgs_{}/".format(config.data.dataset)
@@ -66,27 +71,23 @@ if __name__ == "__main__":
     )
 
     # Latents x ~ p(x)
-    X, A = get_data(key_data, config.data.n_data, dataset=config.data.dataset)
+    X, A = get_data(key_data, config)
 
     # Generate y ~ G[y|A @ x, cov_y] NOTE: is A the same or different for every observation?
     keys = jr.split(key_measurement, config.data.n_data)
     cov_y = jnp.identity(config.data.data_dim) * jnp.square(config.data.sigma_y)
 
-    # NOTE: these corruption A's are specific to datasets...
-    # if config.data.latent_dim != config.data.data_dim:
-    #     # Corrupt if so required
-    #     # A = jax.vmap(lambda key: get_A(key, latent_dim=config.data.latent_dim, observed_dim=config.data.data_dim))(keys)
-    #     A = jnp.stack([jnp.array([[1, 0, 0], [0, 0, 1]])] * config.data.n_data)  # Projects onto the x-z plane
-    #     Y = jax.vmap(lambda key, x, A: measurement(key, x, A=A, cov_y=cov_y))(keys, X, A) 
-    # else:
-    #     A = None
-    #     Y = jax.vmap(lambda key, x: measurement(key, x, A=None, cov_y=cov_y))(keys, X)
-
     if exists(A):
         # NOTE: flatten only for mnist! preprocess_fn that flattens if so required?
-        Y = jax.vmap(lambda key, x, A: measurement(key, x, A=A, cov_y=cov_y))(keys, X, A) 
+        Y = jax.vmap(lambda key, x, A: measurement(key, flatten(x), A=A, cov_y=cov_y))(keys, X, A) 
     else:
         Y = jax.vmap(lambda key, x: measurement(key, x, A=None, cov_y=cov_y))(keys, X)
+
+    # Flatten after each sampling; unflatten to plot only
+    # > reshaping to image shape in DiT 
+    postprocess_fn = lambda x: flatten(x) 
+
+    print("X, Y", X.shape, Y.shape)
 
     # Test if config can fit to p(x)
     if config.train.test_on_latents:
@@ -100,24 +101,28 @@ if __name__ == "__main__":
             use_ema=config.train.use_ema,
             ema_rate=config.train.ema_rate,
             sde_type=config.train.sde_type,
+            postprocess_fn=postprocess_fn,
+            img_size=config.data.img_size,
             replicated_sharding=replicated_sharding,
             distributed_sharding=distributed_sharding,
             save_dir=save_dir
         )
 
-    # PPCA pre-training for q_0(x|mu_x, cov_x)
+    # PPCA pre-training for q_0(x|mu_x, cov_x) NOTE: can batch sample like below with a larger dataset than that used for PPCA...
     if config.train.ppca_pretrain:
         mu_x, cov_x, X_Y = run_ppca(
             key_ppca, 
             flow,
             config.data.latent_dim,
-            Y, #flatten(Y) if config.data.dataset == "mnist" else Y, 
+            Y, 
             A, 
             cov_y=cov_y,
             n_pca_iterations=config.train.n_pca_iterations, 
             sde_type=config.train.sde_type, 
             sampling_mode=config.train.sampling_mode,
             mode=config.train.mode,
+            max_steps=config.train.max_steps,
+            postprocess_fn=postprocess_fn,
             replicated_sharding=replicated_sharding,
             distributed_sharding=distributed_sharding,
             X=X,
@@ -130,17 +135,23 @@ if __name__ == "__main__":
     sampler = get_x_sampler(
         flow, 
         sampling_mode=config.train.sampling_mode, 
-        sde_type=config.train.sde_type
+        sde_type=config.train.sde_type,
+        postprocess_fn=postprocess_fn
     )
-    X_test = jax.vmap(sampler)(keys)
+    X_ = jax.vmap(sampler)(keys)
 
     # Plot initial samples
-    plot_samples(X, X_Y, Y, X_test, dataset=config.data.dataset, save_dir=save_dir)
+    plot_samples(X, X_Y, Y, X_, save_dir=save_dir)
 
     # Expectation maximisation
     losses_k = []
     for k in range(config.train.em_iterations):
         key_k, key_sample = jr.split(jr.fold_in(key_em, k))
+
+        loader = get_loader(
+            maybe_shard(unflatten(X_Y, config.data.img_shape), distributed_sharding), 
+            key=key_k
+        )
 
         # Train on sampled latents
         losses_s = []
@@ -148,7 +159,8 @@ if __name__ == "__main__":
             config.train.diffusion_iterations, desc="Training", colour="green"
         ) as steps:
             for s, xy in zip(
-                steps, get_loader(X_Y, key=key_k).loop(config.train.n_batch)
+                steps, 
+                loader.loop(config.train.n_batch)
             ):
                 key_x, key_step = jr.split(jr.fold_in(key_k, s))
 
@@ -176,17 +188,37 @@ if __name__ == "__main__":
             losses_k, k, config.train.diffusion_iterations, save_dir=save_dir
         )
 
-        # Generate latents from q(x|y)
-        sampler = get_x_y_sampler(
-            ema_flow if config.train.use_ema else flow, 
-            cov_y=cov_y, 
-            mu_x=mu_x, 
-            cov_x=cov_x, 
-            sde_type=config.train.sde_type,
-            sampling_mode=config.train.sampling_mode, 
-        )
-        keys = jr.split(key_sample, config.data.n_data)
-        X_Y = jax.vmap(sampler)(keys, Y)
+        # Batch sample X|Y for all Y
+        n_batch_sample = 100
+        n_batches_sample = int(config.data.n_data / n_batch_sample)
+        X_Y = []
+        with trange(
+            n_batches_sample, desc="Sampling X|Y", colour="magenta"
+        ) as steps:
+            for _, _Y, _A in zip(
+                steps, 
+                jnp.split(Y, n_batches_sample),
+                jnp.split(A, n_batches_sample)
+            ):
+                # Generate latents from q(x|y)
+                sampler = get_x_y_sampler(
+                    ema_flow if config.train.use_ema else flow, 
+                    cov_y=cov_y, 
+                    mu_x=mu_x, 
+                    cov_x=cov_x, 
+                    mode=config.train.mode,
+                    max_steps=config.train.max_steps,
+                    sde_type=config.train.sde_type,
+                    sampling_mode=config.train.sampling_mode, 
+                    postprocess_fn=postprocess_fn
+                )
+
+                keys = jr.split(key_sample, n_batch_sample) # NOTE: split key
+                X_Y_ = jax.vmap(sampler)(keys, _Y, _A)
+
+                X_Y.append(X_Y_)
+
+        X_Y = jnp.concatenate(X_Y)
 
         if config.train.clip_x_y:
             X_Y = clip_latents(X_Y, config.train.x_clip_limit) 
@@ -195,12 +227,13 @@ if __name__ == "__main__":
         sampler = get_x_sampler(
             ema_flow if config.train.use_ema else flow, 
             sampling_mode=config.train.sampling_mode, 
-            sde_type=config.train.sde_type
+            sde_type=config.train.sde_type,
+            postprocess_fn=postprocess_fn
         )
-        X_test = jax.vmap(sampler)(keys)
+        X_ = jax.vmap(sampler)(keys)
 
         # Plot latents
-        plot_samples(X, X_Y, Y, X_test, dataset=config.data.dataset, iteration=k + 1, save_dir=save_dir)
+        plot_samples(X, X_Y, Y, X_, iteration=k + 1, save_dir=save_dir)
 
         if k > 1:
             create_gif(save_dir)
