@@ -11,6 +11,7 @@ from tqdm.auto import trange
 from configs import (
     get_blob_config, get_double_blob_config, 
     get_gmm_config, get_mnist_config, 
+    get_spiral_config, get_moons_config,
     save_config
 )
 from rf import get_rectified_flow
@@ -22,7 +23,7 @@ from utils import (
     get_opt_and_state, clear_and_get_results_dir, 
     create_gif, plot_losses, plot_samples, 
     clip_latents, get_data, measurement,
-    get_loader
+    get_loader, get_A
 )
 from ppca import run_ppca
 
@@ -33,9 +34,11 @@ if __name__ == "__main__":
 
     key_net, key_data, key_measurement, key_ppca, key_em = jr.split(key, 5)
 
-    config = get_double_blob_config() 
+    config = get_moons_config() # get_spiral_config() 
 
-    save_dir = clear_and_get_results_dir(save_dir="out/imgs_{}/".format(config.data.dataset))
+    save_dir = clear_and_get_results_dir(
+        save_dir="out/imgs_{}/".format(config.data.dataset)
+    )
 
     save_config(config, filename=os.path.join(save_dir, "config.yml"))
 
@@ -60,13 +63,23 @@ if __name__ == "__main__":
         diffusion_iterations=config.train.diffusion_iterations
     )
 
-    # Latents
+    # Latents x ~ p(x)
     X = get_data(key_data, config.data.n_data, dataset=config.data.dataset)
 
-    # Generate y ~ G[y|x, cov_y]
-    cov_y = jnp.eye(config.data.data_dim) * jnp.square(config.data.sigma_y)
+    # Generate y ~ G[y|A @ x, cov_y] NOTE: is A the same or different for every observation?
     keys = jr.split(key_measurement, config.data.n_data)
-    Y = jax.vmap(partial(measurement, cov_y=cov_y))(keys, X) 
+    cov_y = jnp.identity(config.data.data_dim) * jnp.square(config.data.sigma_y)
+    if config.data.latent_dim != config.data.data_dim:
+        # Corrupt if so required
+        # A = jax.vmap(lambda key: get_A(key, latent_dim=config.data.latent_dim, observed_dim=config.data.data_dim))(keys)
+        A = jnp.stack([jnp.array([[1, 0, 0], [0, 0, 1]])] * config.data.n_data)  # Projects onto the x-z plane
+        Y = jax.vmap(lambda key, x, A: measurement(key, x, A=A, cov_y=cov_y))(keys, X, A) 
+    else:
+        A = None
+        Y = jax.vmap(lambda key, x: measurement(key, x, A=None, cov_y=cov_y))(keys, X)
+
+    print("cov_y", cov_y.shape)
+    # print("A", A.shape)
 
     # Test if config can fit to p(x)
     if config.train.test_on_latents:
@@ -88,15 +101,19 @@ if __name__ == "__main__":
         mu_x, cov_x, X_Y = run_ppca(
             key_ppca, 
             flow,
+            config.data.latent_dim,
             Y, 
+            A, 
             cov_y=cov_y,
             n_pca_iterations=config.train.n_pca_iterations, 
             sde_type=config.train.sde_type, 
             sampling_mode=config.train.sampling_mode,
-            X=X
+            mode=config.train.mode,
+            X=X,
+            save_dir=save_dir
         )
     else:
-        X_Y = jax.vmap(partial(measurement, cov_y=5. * cov_y))(keys, X) # Testing
+        X_Y = jax.vmap(partial(measurement, cov_y=5. * cov_y))(keys, X, A) # Testing
 
     # Initial model samples
     sampler = get_x_sampler(
@@ -154,7 +171,7 @@ if __name__ == "__main__":
             cov_x=cov_x, 
             sde_type=config.train.sde_type,
             sampling_mode=config.train.sampling_mode, 
-            q_0_sampling=True
+            q_0_sampling=False
         )
         keys = jr.split(key_sample, config.data.n_data)
         X_Y = jax.vmap(sampler)(keys, Y)

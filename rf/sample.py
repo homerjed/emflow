@@ -1,5 +1,4 @@
-from functools import partial
-from typing import Callable, Literal, Optional, Union
+from typing import Literal, Optional
 
 import jax
 import jax.numpy as jnp
@@ -10,11 +9,17 @@ import diffrax as dfx
 from custom_types import (
     XArray, XCovariance, YArray, YCovariance, TCovariance, 
     XSampleFn, XYSampleFn, SampleType, SDEType, PRNGKeyArray,
-    Scalar, typecheck
+    OperatorFn, OperatorMatrix, Scalar, typecheck
 )
 from rf import RectifiedFlow, velocity_to_score, score_to_velocity, get_flow_soln_kwargs
 from utils import exists, maybe_invert
-from posterior import get_score_gaussian_y_x, get_score_gaussian_x_y
+from posterior import (
+    get_score_gaussian_y_x, 
+    get_score_gaussian_x_y, 
+    get_score_gaussian_x_y_cg, 
+    get_score_y_x, 
+    get_score_y_x_cg
+)
 
 
 """
@@ -158,6 +163,7 @@ def single_x_y_sample_fn_ode(
     flow: RectifiedFlow,
     key: PRNGKeyArray, 
     y_: YArray,
+    A: Optional[OperatorMatrix],
     cov_y: YCovariance, 
     mu_x: Optional[XArray] = None,
     inv_cov_x: Optional[XCovariance] = None, 
@@ -168,24 +174,33 @@ def single_x_y_sample_fn_ode(
 ) -> XArray:
     # Latent posterior sampling function
 
+    cov_x = jnp.linalg.inv(inv_cov_x) # NOTE: just supply cov_x
+
     def reverse_ode(t: Scalar, x: XArray, args: Optional[tuple]) -> XArray:
         # Sampling along conditional score p(x|y)
         t = jnp.asarray(t)
 
         if q_0_sampling:
             # Implement CG method for this
-            score_x_y = get_score_gaussian_x_y(
-                y_, x, t, flow, cov_y=cov_y, mu_x=mu_x, inv_cov_x=inv_cov_x
-            )
+            if mode == "full":
+                score_x_y = get_score_gaussian_x_y(
+                    y_, A, x, t, flow, cov_y=cov_y, mu_x=mu_x, inv_cov_x=inv_cov_x
+                )
+            if mode == "cg":
+                score_x_y = get_score_gaussian_x_y_cg(
+                    y_, A, x, t, flow, cov_y=cov_y, mu_x=mu_x, inv_cov_x=inv_cov_x
+                )
         else:
             if mode == "full":
-                score_x_y = get_score_x_y(
-                    y_, x, t, flow, cov_y, return_score_x=True # x is x_t
+                # NOTE: need to implement using A here...
+                score_y_x, score_x = get_score_y_x(
+                    y_, A, x, t, flow, cov_y, return_score_x=True # x is x_t
                 ) 
             if mode == "cg":
                 score_y_x, score_x = get_score_y_x_cg(
-                    y_, x, t, flow, cov_x, cov_y, return_score_x=True
+                    y_, A, x, t, flow, cov_x, cov_y, return_score_x=True
                 ) 
+            score_x_y = score_y_x + score_x
 
         return flow.reverse_ode(x, t, score=score_x_y, sde_type=sde_type) 
 
@@ -397,18 +412,20 @@ def get_x_y_sampler_ode(
 
     inv_cov_x = maybe_invert(cov_x)
 
-    fn = lambda key, y_: single_x_y_sample_fn_ode(
-        flow, 
-        key, 
-        y_, 
-        cov_y, 
-        mu_x,
-        inv_cov_x, 
-        mode=mode, 
-        sde_type=sde_type,
-        q_0_sampling=q_0_sampling # NOTE: Why does this need cov_x? Does cov_x need iterating?
-    )
-    return fn
+    def sampler(key, y_, A=None): 
+        return single_x_y_sample_fn_ode(
+            flow, 
+            key, 
+            y_, 
+            A,
+            cov_y, 
+            mu_x,
+            inv_cov_x, 
+            mode=mode, 
+            sde_type=sde_type,
+            q_0_sampling=q_0_sampling # NOTE: Why does this need cov_x? Does cov_x need iterating?
+        )
+    return sampler
 
 
 @typecheck
@@ -454,6 +471,7 @@ def get_x_y_sampler(
     mu_x: Optional[XArray] = None,
     cov_x: Optional[XCovariance] = None,
     *,
+    mode: Literal["full", "cg"] = "full",
     sde_type: SDEType = "zero-ends",
     q_0_sampling: bool = False
 ) -> XYSampleFn:
@@ -475,6 +493,7 @@ def get_x_y_sampler(
         mu_x=mu_x, 
         cov_x=cov_x, 
         sde_type=sde_type, 
+        mode=mode,
         q_0_sampling=q_0_sampling
     )
 

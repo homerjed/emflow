@@ -54,9 +54,10 @@ def unflatten(x: Array, height: int, width: int) -> Array:
 """
 
 
-def clear_and_get_results_dir(save_dir: str) -> str:
+def clear_and_get_results_dir(save_dir: str, clear_previous: bool = True) -> str:
     # Image save directories
-    rmtree(save_dir, ignore_errors=True) # Clear old ones
+    if clear_previous:
+        rmtree(save_dir, ignore_errors=True) # Clear old ones
     if not os.path.exists(save_dir):
         os.makedirs(save_dir, exist_ok=True)
     return save_dir 
@@ -233,6 +234,25 @@ def get_data(key: PRNGKeyArray, n: int, dataset: Datasets) -> Float[Array, "n d"
         )
         X = gaussian_mixture.sample((n,), seed=key)
 
+    if dataset == "spiral":
+        from sklearn.datasets import make_swiss_roll
+
+        X, _ = make_swiss_roll(n, noise=0.01)  # X is (n_samples, 3)
+        X = 2. * (X - X.min()) / (X.max() - X.min()) - 1.  # Normalize to [0, 1]
+
+        # fig = plt.figure(figsize=(12, 5))
+        # ax = fig.add_subplot(121, projection='3d')
+        # ax.scatter(X[:, 0], X[:, 1], X[:, 2], c=X[:, 0], cmap='Spectral')
+        # ax.set_title("Original 3D Swiss Roll")
+
+        # noise = np.random.normal(scale=0.02, size=(n_samples, 2))  # Gaussian noise
+        # Y = np.einsum("nij, nj -> ni", A, X) + noise  
+
+        # ax = fig.add_subplot(122)
+        # ax.scatter(Y[:, 0], Y[:, 1], c=X[:, 0], cmap='Spectral')
+        # ax.set_title("Projected & Noisy 2D Data")
+        # plt.show()
+
     # NOTE: shuffle so a representative set are used / plotted in all cases
     X = jr.choice(key, X, (n,)) # Shuffle
 
@@ -243,13 +263,25 @@ def get_data(key: PRNGKeyArray, n: int, dataset: Datasets) -> Float[Array, "n d"
     return jnp.asarray(X)
 
 
+def get_A(key: PRNGKeyArray, latent_dim: int = 3, observed_dim: int = 2) -> Float[Array, "y x"]:
+    # Generate corruption matrix A, data_dim is latent variable size
+    # one_and_zeros = jnp.array([1.] * observed_dim + [0.] * (latent_dim - observed_dim)) # Assuming n 
+    # A = jnp.diag(jr.permutation(key, one_and_zeros,))
+    idx = jr.choice(key, latent_dim, shape=(observed_dim,), replace=False)  # Sample m indices
+    A = jnp.zeros((observed_dim, latent_dim)).at[jnp.arange(observed_dim), idx].set(1)
+    return A.astype(jnp.int32)
+
+
 def measurement(
     key: PRNGKeyArray, 
-    x: Float[Array, "d"], 
-    cov_y: Float[Array, "d d"]
+    x: Float[Array, "x"], 
+    *,
+    A: Optional[Float[Array, "y x"]], 
+    cov_y: Float[Array, "y y"]
 ) -> Float[Array, "d"]: 
     # Sample from G[y|x, cov_y]
-    return jr.multivariate_normal(key, x, cov_y) 
+    mu_y = A @ x if exists(A) else x
+    return jr.multivariate_normal(key, mu_y, cov_y) 
 
 
 class _AbstractDataLoader(metaclass=abc.ABCMeta):

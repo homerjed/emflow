@@ -46,8 +46,9 @@ def time_sampler(
     t1: float, 
     time_schedule: Optional[Callable[[Scalar], Scalar]] = None
 ) -> Scalar:
-    t = jr.uniform(key, (n,), minval=t0, maxval=t1 / n) # t = jax.random.beta(keys[1], a=3, b=3, shape=(n,))
+    t = jr.uniform(key, (n,), minval=t0, maxval=t1 / n) # 
     t = t + (t1 / n) * jnp.arange(n)
+    # t = jr.beta(key, a=3., b=3., shape=(n,))
     if exists(time_schedule):
         t = time_schedule(t)
     return t

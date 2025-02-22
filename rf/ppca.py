@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Literal
 from functools import partial
 import jax
 import jax.numpy as jnp
@@ -8,15 +8,16 @@ from tqdm import trange
 
 from custom_types import (
     XArray, XCovariance, SDEType, 
-    SampleType, PRNGKeyArray, 
-    Float, Array, typecheck
+    SampleType, PRNGKeyArray, Scalar,
+    Float, Array, Int, OperatorFn, 
+    typecheck
 )
 from rf import RectifiedFlow
 from sample import get_x_y_sampler
 from utils import plot_losses_ppca
 
 
-def gaussian_log_prob(x, mu_x, cov_x):
+def gaussian_log_prob(x: XArray, mu_x: XArray, cov_x: XCovariance) -> Scalar:
     return jax.scipy.stats.multivariate_normal.logpdf(x, mu_x, cov_x)
 
 
@@ -66,18 +67,23 @@ def ppca(
 def run_ppca(
     key: PRNGKeyArray, 
     flow: RectifiedFlow,
-    Y: Float[Array, "n d"], 
-    cov_y: Float[Array, "d d"],
+    latent_dim: int,
+    Y: Float[Array, "n y"], 
+    A: Int[Array, "n y x"],
+    cov_y: Float[Array, "y y"],
+    n_pca_iterations: int = 256,
+    *,
+    mode: Literal["cg", "full"] = "full",
     sde_type: SDEType, 
     sampling_mode: SampleType,
-    n_pca_iterations: int = 256,
-    X: Optional[Float[Array, "n d"]] = None, # Only for loss, debugging
-) -> tuple[XArray, XCovariance, Float[Array, "n d"]]:
+    X: Optional[Float[Array, "n x"]] = None, # Only for loss, debugging
+    save_dir: str = None
+) -> tuple[XArray, XCovariance, Float[Array, "n x"]]:
 
     n_data, data_dim = Y.shape
 
-    mu_x = jnp.zeros(data_dim)
-    cov_x = jnp.identity(data_dim) # Start at cov_y?
+    mu_x = jnp.zeros(latent_dim)
+    cov_x = jnp.identity(latent_dim) # Start at cov_y?
 
     X_Y = Y
 
@@ -95,10 +101,11 @@ def run_ppca(
                 cov_x=cov_x, 
                 sde_type=sde_type,
                 sampling_mode=sampling_mode, 
+                mode=mode, 
                 q_0_sampling=True
             )
             keys = jr.split(key_sample, n_data)
-            X_Y = jax.vmap(sampler)(keys, Y)
+            X_Y = jax.vmap(sampler)(keys, Y, A)
 
             mu_x, cov_x = ppca(X_Y, key_pca, rank=data_dim)
 
@@ -112,5 +119,5 @@ def run_ppca(
     print("mu/cov x: {} \n {}".format(mu_x, cov_x))
 
     if X is not None:
-        plot_losses_ppca(log_probs_x)
+        plot_losses_ppca(log_probs_x, save_dir)
     return mu_x, cov_x, X_Y
